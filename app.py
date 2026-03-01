@@ -469,7 +469,7 @@ def calc_atr(df, period=14):
     return tr.rolling(period).mean().iloc[-1]
 
 # ─── ランキング計算 ───────────────────────────────────────────
-@st.cache_data(ttl=300, show_spinner=False)
+@st.cache_data(ttl=86400, show_spinner=False)
 def compute_rankings(_progress_callback=None):
     results = []
     tickers = list(NIKKEI225_TICKERS.items())
@@ -496,12 +496,15 @@ def draw_chart(stock_data):
         vertical_spacing=0.05
     )
 
-    # ローソク足
+    # ローソク足（日本式：陽線=赤、陰線=青）
     fig.add_trace(go.Candlestick(
         x=df.index, open=df['Open'], high=df['High'],
         low=df['Low'], close=df['Close'],
-        name="ローソク", increasing_line_color='#3fb950',
-        decreasing_line_color='#f85149'
+        name="ローソク",
+        increasing_line_color='#f85149',
+        increasing_fillcolor='#f85149',
+        decreasing_line_color='#4d9de0',
+        decreasing_fillcolor='#4d9de0'
     ), row=1, col=1)
 
     # ボリンジャーバンド
@@ -590,6 +593,31 @@ def calc_margin_units(capital, price, margin_rate=0.3):
     units = int((buying_power * 0.3) / price / 100) * 100  # 1銘柄に資金の30%まで
     return max(units, 100)
 
+def fetch_stock_name(ticker_code):
+    """銘柄コードから銘柄名を取得（日経225リストを優先し、なければyfinanceから取得）"""
+    if ticker_code in NIKKEI225_TICKERS:
+        return NIKKEI225_TICKERS[ticker_code]
+    try:
+        ticker = yf.Ticker(f"{ticker_code}.T")
+        info = ticker.info
+        name = info.get("longName") or info.get("shortName") or ticker_code
+        return name
+    except:
+        return ticker_code
+
+def calc_recommended_tp_sl(ticker_code, entry_price):
+    """ATRベースで推奨利確・損切り価格を計算"""
+    try:
+        df = fetch_stock_data(ticker_code)
+        if df is None:
+            return round(entry_price * 1.05, 0), round(entry_price * 0.97, 0)
+        atr = calc_atr(df)
+        take_profit = round(entry_price + atr * 2.5, 0)
+        stop_loss = round(entry_price - atr * 1.0, 0)
+        return take_profit, stop_loss
+    except:
+        return round(entry_price * 1.05, 0), round(entry_price * 0.97, 0)
+
 # ─── ポートフォリオ管理 ──────────────────────────────────────
 def portfolio_section(portfolio):
     st.markdown('<div class="section-header">📂 保有株管理</div>', unsafe_allow_html=True)
@@ -649,38 +677,75 @@ def portfolio_section(portfolio):
 
     # 新規ポジション追加
     with st.expander("➕ 新規ポジション追加"):
-        c1, c2, c3, c4 = st.columns(4)
-        with c1:
-            new_code = st.text_input("銘柄コード", placeholder="7203")
-        with c2:
-            new_name = st.text_input("銘柄名", value=NIKKEI225_TICKERS.get(new_code, ""))
-        with c3:
-            new_entry = st.number_input("取得単価", min_value=0.0, step=10.0)
-        with c4:
-            new_units = st.number_input("株数", min_value=0, step=100, value=100)
+        st.markdown('<div style="color:#8b949e; font-size:0.8rem; margin-bottom:12px;">銘柄コードと取得単価・株数を入力すると、銘柄名の自動取得と利確・損切りの推奨値を計算します。</div>', unsafe_allow_html=True)
 
         c1, c2, c3 = st.columns(3)
         with c1:
-            new_tp = st.number_input("利確目標（円）", min_value=0.0, step=10.0)
+            new_code = st.text_input("銘柄コード", placeholder="例：7203", key="new_pos_code")
         with c2:
-            new_sl = st.number_input("損切ライン（円）", min_value=0.0, step=10.0)
+            new_entry = st.number_input("取得単価（円）", min_value=0.0, step=10.0, key="new_pos_entry")
         with c3:
-            new_date = st.date_input("取得日", value=datetime.today())
+            new_units = st.number_input("株数", min_value=0, step=100, value=100, key="new_pos_units")
 
-        if st.button("ポジションを追加"):
-            if new_code and new_entry > 0 and new_units > 0:
+        # 銘柄コードと取得単価が入力されたら自動計算して表示
+        if new_code and len(new_code) >= 4 and new_entry > 0:
+            auto_name = fetch_stock_name(new_code.strip())
+            rec_tp, rec_sl = calc_recommended_tp_sl(new_code.strip(), new_entry)
+            profit_pct = (rec_tp / new_entry - 1) * 100
+            loss_pct = (rec_sl / new_entry - 1) * 100
+            rr = profit_pct / abs(loss_pct) if loss_pct != 0 else 0
+            est_pl_profit = (rec_tp - new_entry) * new_units
+            est_pl_loss = (new_entry - rec_sl) * new_units
+
+            st.markdown(f"""
+            <div style="background:#0d1117; border:1px solid #30363d; border-radius:10px; padding:16px; margin-top:10px;">
+                <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:12px;">
+                    <div>
+                        <span style="color:#f0f6fc; font-weight:700; font-size:1.05rem;">{auto_name}</span>
+                        <span style="color:#8b949e; font-size:0.8rem; margin-left:8px;">{new_code.strip()}</span>
+                    </div>
+                    <span style="color:#8b949e; font-size:0.75rem;">銘柄名・推奨値を自動計算</span>
+                </div>
+                <div style="display:grid; grid-template-columns:repeat(4,1fr); gap:12px; font-family:'JetBrains Mono',monospace; font-size:0.82rem;">
+                    <div>
+                        <div class="order-label">推奨 利確目標</div>
+                        <div style="color:#3fb950; font-weight:700; font-size:1rem;">¥{rec_tp:,.0f}</div>
+                        <div style="color:#8b949e; font-size:0.72rem;">+{profit_pct:.1f}%　期待利益: +¥{est_pl_profit:,.0f}</div>
+                    </div>
+                    <div>
+                        <div class="order-label">推奨 損切ライン</div>
+                        <div style="color:#f85149; font-weight:700; font-size:1rem;">¥{rec_sl:,.0f}</div>
+                        <div style="color:#8b949e; font-size:0.72rem;">{loss_pct:.1f}%　リスク: -¥{est_pl_loss:,.0f}</div>
+                    </div>
+                    <div>
+                        <div class="order-label">リスクリワード比</div>
+                        <div style="color:#ffa657; font-weight:700; font-size:1rem;">1 : {rr:.2f}</div>
+                        <div style="color:#8b949e; font-size:0.72rem;">ATRベース自動計算</div>
+                    </div>
+                    <div>
+                        <div class="order-label">取得コスト（現物）</div>
+                        <div style="color:#79c0ff; font-weight:700; font-size:1rem;">¥{new_entry * new_units:,.0f}</div>
+                        <div style="color:#8b949e; font-size:0.72rem;">{new_units:,}株 @ ¥{new_entry:,.0f}</div>
+                    </div>
+                </div>
+            </div>
+            """, unsafe_allow_html=True)
+
+            st.markdown("")
+            if st.button(f"📌 {auto_name}（{new_code.strip()}）をポートフォリオに追加", key="add_position_btn"):
                 portfolio["positions"].append({
-                    "code": new_code,
-                    "name": new_name or NIKKEI225_TICKERS.get(new_code, new_code),
+                    "code": new_code.strip(),
+                    "name": auto_name,
                     "entry_price": float(new_entry),
                     "units": int(new_units),
-                    "take_profit": float(new_tp),
-                    "stop_loss": float(new_sl),
-                    "entry_date": str(new_date)
+                    "take_profit": float(rec_tp),
+                    "stop_loss": float(rec_sl),
                 })
                 save_portfolio(portfolio)
-                st.success(f"✅ {new_name} を追加しました")
+                st.success(f"✅ {auto_name} をポートフォリオに追加しました！")
                 st.rerun()
+        else:
+            st.markdown('<div style="color:#8b949e; font-size:0.8rem; padding:8px 0;">↑ 銘柄コードと取得単価を入力すると、推奨利確・損切りが自動で表示されます</div>', unsafe_allow_html=True)
 
     # 保有ポジション一覧
     if not positions:
@@ -723,13 +788,12 @@ def portfolio_section(portfolio):
                             <span style="color:{pl_color}; font-size:0.8rem; margin-left:4px;">({sign}{pl_pct:.1f}%)</span>
                         </div>
                     </div>
-                    <div style="display:grid; grid-template-columns:repeat(6,1fr); gap:8px; font-size:0.78rem;">
+                    <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:8px; font-size:0.78rem;">
                         <div><div class="order-label">現在値</div><div style="color:#79c0ff;font-weight:600;">¥{current_price:,.0f}</div></div>
                         <div><div class="order-label">取得単価</div><div style="color:#f0f6fc;">¥{pos['entry_price']:,.0f}</div></div>
                         <div><div class="order-label">株数</div><div style="color:#f0f6fc;">{pos['units']:,}株</div></div>
                         <div><div class="order-label">利確目標</div><div style="color:#3fb950;">¥{pos.get('take_profit', 0):,.0f} {'({:.1f}%)'.format(tp_dist) if tp_dist else ''}</div></div>
                         <div><div class="order-label">損切ライン</div><div style="color:#f85149;">¥{pos.get('stop_loss', 0):,.0f} {'({:.1f}%)'.format(sl_dist) if sl_dist else ''}</div></div>
-                        <div><div class="order-label">取得日</div><div style="color:#8b949e;">{pos.get('entry_date', '-')}</div></div>
                     </div>
                 </div>
                 """, unsafe_allow_html=True)
@@ -762,6 +826,12 @@ def portfolio_section(portfolio):
 # ─── メインアプリ ─────────────────────────────────────────────
 def main():
     portfolio = load_portfolio()
+
+    # セッション状態初期化
+    if "rankings_loaded" not in st.session_state:
+        st.session_state.rankings_loaded = False
+    if "rankings_data" not in st.session_state:
+        st.session_state.rankings_data = []
 
     # ヘッダー
     st.markdown("""
@@ -799,16 +869,35 @@ def main():
 
         st.markdown("---")
         if st.button("🔄 ランキング更新", use_container_width=True):
-            st.cache_data.clear()
+            compute_rankings.clear()
+            st.session_state.rankings_loaded = False
+            st.session_state.rankings_data = []
             st.rerun()
 
-    # ─── ランキングページ ─────────────────────────────────────
     if "ランキング" in page:
         st.markdown('<div class="section-header">🏆 投資スコア ランキング TOP20（日経225）</div>', unsafe_allow_html=True)
         st.caption("💡 テクニカル指標（RSI・MACD・BB・MA・出来高）を総合スコアリング。スイングトレード（数日〜2週間）に最適化。")
 
-        with st.spinner("銘柄データを取得・分析中..."):
-            rankings = compute_rankings()
+        # 未ロード時はボタンを表示
+        if not st.session_state.rankings_loaded:
+            st.markdown("""
+            <div style="background:#161b22; border:1px solid #30363d; border-radius:12px; padding:32px; text-align:center; margin:24px 0;">
+                <div style="font-size:2.5rem; margin-bottom:12px;">📊</div>
+                <div style="color:#f0f6fc; font-size:1.1rem; font-weight:700; margin-bottom:8px;">ランキングを取得する</div>
+                <div style="color:#8b949e; font-size:0.85rem; margin-bottom:20px;">日経225全銘柄をテクニカル分析します（約30〜60秒）<br>サイドバーの「🔄 ランキング更新」ボタンを押すと最新データで再計算します</div>
+            </div>
+            """, unsafe_allow_html=True)
+            col1, col2, col3 = st.columns([1, 2, 1])
+            with col2:
+                if st.button("📈 ランキングを取得する", use_container_width=True):
+                    with st.spinner("銘柄データを取得・分析中...（しばらくお待ちください）"):
+                        rankings = compute_rankings()
+                    st.session_state.rankings_data = rankings
+                    st.session_state.rankings_loaded = True
+                    st.rerun()
+            return
+
+        rankings = st.session_state.rankings_data
 
         # フィルタリング
         filtered = [r for r in rankings if r['score'] >= min_score and r['rr_ratio'] >= min_rr]
@@ -910,7 +999,6 @@ def main():
                             "units": units,
                             "take_profit": stock['take_profit'],
                             "stop_loss": stock['stop_loss'],
-                            "entry_date": str(datetime.today().date())
                         })
                         save_portfolio(portfolio)
                         st.success(f"✅ {stock['name']} を追加しました！")
