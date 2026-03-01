@@ -203,8 +203,17 @@ PORTFOLIO_FILE = "portfolio.json"
 def load_portfolio():
     if os.path.exists(PORTFOLIO_FILE):
         with open(PORTFOLIO_FILE, "r", encoding="utf-8") as f:
-            return json.load(f)
-    return {"positions": [], "account_capital": 3000000, "monthly_target": 200000}
+            data = json.load(f)
+        # 型を正規化（JSONからfloatで読み込まれる可能性があるためintに統一）
+        data["account_capital"] = float(data.get("account_capital", 3000000))
+        data["monthly_target"] = float(data.get("monthly_target", 200000))
+        for pos in data.get("positions", []):
+            pos["entry_price"] = float(pos.get("entry_price", 0))
+            pos["units"] = int(pos.get("units", 0))
+            pos["take_profit"] = float(pos.get("take_profit", 0))
+            pos["stop_loss"] = float(pos.get("stop_loss", 0))
+        return data
+    return {"positions": [], "account_capital": 3000000.0, "monthly_target": 200000.0}
 
 def save_portfolio(portfolio):
     with open(PORTFOLIO_FILE, "w", encoding="utf-8") as f:
@@ -665,9 +674,9 @@ def portfolio_section(portfolio):
     with st.expander("⚙️ アカウント設定"):
         c1, c2 = st.columns(2)
         with c1:
-            new_cap = st.number_input("運用資金（円）", value=cap, step=100000, min_value=0)
+            new_cap = st.number_input("運用資金（円）", value=float(cap), step=100000.0, min_value=0.0)
         with c2:
-            new_target = st.number_input("月間目標利益（円）", value=target, step=10000, min_value=0)
+            new_target = st.number_input("月間目標利益（円）", value=float(target), step=10000.0, min_value=0.0)
         if st.button("設定を保存"):
             portfolio["account_capital"] = new_cap
             portfolio["monthly_target"] = new_target
@@ -814,10 +823,10 @@ def portfolio_section(portfolio):
                         st.success("✅ 更新しました")
                         st.rerun()
 
-                close_price_inp = st.number_input("クローズ価格（決済）", value=float(current_price), step=10.0, key=f"close_{i}")
+                close_price_inp = st.number_input("クローズ価格（決済）", value=float(current_price), step=1.0, key=f"close_{i}")
                 if st.button(f"🔴 {pos['name']} をクローズ（ポジション削除）", key=f"close_btn_{i}"):
-                    realized_pl = (close_price_inp - pos['entry_price']) * pos['units']
-                    portfolio["account_capital"] += realized_pl
+                    realized_pl = (float(close_price_inp) - float(pos['entry_price'])) * int(pos['units'])
+                    portfolio["account_capital"] = float(portfolio.get("account_capital", 3000000)) + realized_pl
                     portfolio["positions"].pop(i)
                     save_portfolio(portfolio)
                     st.success(f"✅ {pos['name']} をクローズ。実現損益: {'+' if realized_pl >= 0 else ''}¥{realized_pl:,.0f}")
