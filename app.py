@@ -1476,6 +1476,7 @@ def main():
                 market_adj_html = ""
 
 
+            pct_color  = "#3fb950" if stock['pct_1d'] >= 0 else "#f85149"
             pct5_color = "#3fb950" if stock['pct_5d'] >= 0 else "#f85149"
             sign1d = "+" if stock['pct_1d'] >= 0 else ""
             sign5d = "+" if stock['pct_5d'] >= 0 else ""
