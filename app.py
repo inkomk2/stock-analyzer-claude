@@ -264,7 +264,242 @@ def calc_bollinger(series, period=20, std=2):
     lower = ma - std * std_dev
     return upper, ma, lower
 
-def analyze_stock(ticker_code, name):
+# ─── 市場環境チェック ────────────────────────────────────────
+@st.cache_data(ttl=1800)
+def calc_market_environment():
+    """
+    日経225・TOPIX・VIXを取得してトレンド判定。
+    戻り値: dict {
+        phase, phase_label, phase_color,
+        score_multiplier,   # 個別スコアへの乗数 0.6〜1.15
+        score_adj,          # 個別スコアへの加減点 -20〜+10
+        nk_price, nk_1d, nk_5d, nk_20d,
+        nk_ma5, nk_ma20, nk_rsi,
+        topix_1d, topix_5d,
+        vix, vix_level,
+        warnings, positives
+    }
+    """
+    result = {
+        "phase": "neutral", "phase_label": "中立", "phase_color": "#8b949e",
+        "score_multiplier": 1.0, "score_adj": 0,
+        "nk_price": None, "nk_1d": 0.0, "nk_5d": 0.0, "nk_20d": 0.0,
+        "nk_ma5": None, "nk_ma20": None, "nk_rsi": 50.0,
+        "topix_1d": 0.0, "topix_5d": 0.0,
+        "vix": None, "vix_level": "normal",
+        "warnings": [], "positives": []
+    }
+    try:
+        # 日経225
+        nk = yf.Ticker("^N225")
+        nk_df = nk.history(period="3mo", interval="1d")
+        if nk_df is not None and len(nk_df) >= 20:
+            nk_close = nk_df['Close']
+            result["nk_price"] = nk_close.iloc[-1]
+            result["nk_1d"]  = (nk_close.iloc[-1] / nk_close.iloc[-2]  - 1) * 100
+            result["nk_5d"]  = (nk_close.iloc[-1] / nk_close.iloc[-5]  - 1) * 100 if len(nk_close) >= 5  else 0
+            result["nk_20d"] = (nk_close.iloc[-1] / nk_close.iloc[-20] - 1) * 100 if len(nk_close) >= 20 else 0
+            result["nk_ma5"]  = nk_close.rolling(5).mean().iloc[-1]
+            result["nk_ma20"] = nk_close.rolling(20).mean().iloc[-1]
+            result["nk_rsi"]  = calc_rsi(nk_close).iloc[-1]
+
+        # TOPIX (ETF: 1306.T)
+        try:
+            tp = yf.Ticker("1306.T")
+            tp_df = tp.history(period="1mo", interval="1d")
+            if tp_df is not None and len(tp_df) >= 5:
+                tc = tp_df['Close']
+                result["topix_1d"] = (tc.iloc[-1] / tc.iloc[-2] - 1) * 100
+                result["topix_5d"] = (tc.iloc[-1] / tc.iloc[-5] - 1) * 100 if len(tc) >= 5 else 0
+        except:
+            pass
+
+        # VIX（日本版: ^JNIV、取れなければ^VIX）
+        for vix_sym in ["^JNIV", "^VIX"]:
+            try:
+                vx = yf.Ticker(vix_sym)
+                vx_df = vx.history(period="5d", interval="1d")
+                if vx_df is not None and not vx_df.empty:
+                    result["vix"] = vx_df['Close'].iloc[-1]
+                    break
+            except:
+                pass
+
+    except Exception as e:
+        pass
+
+    # ── フェーズ判定ロジック ──
+    nk_price = result["nk_price"]
+    nk_ma5   = result["nk_ma5"]
+    nk_ma20  = result["nk_ma20"]
+    nk_rsi   = result["nk_rsi"]
+    nk_1d    = result["nk_1d"]
+    nk_5d    = result["nk_5d"]
+    nk_20d   = result["nk_20d"]
+    vix      = result["vix"]
+
+    warnings  = []
+    positives = []
+    adj       = 0  # スコア加減点
+
+    if nk_price and nk_ma5 and nk_ma20:
+        # 強気シグナル
+        if nk_price > nk_ma5 > nk_ma20:
+            positives.append("日経がMA5>MA20の上昇配列")
+            adj += 5
+        elif nk_price > nk_ma20:
+            positives.append("日経がMA20上で推移")
+            adj += 2
+
+        # 弱気シグナル
+        if nk_price < nk_ma20:
+            warnings.append("日経がMA20を下回っている（下降トレンド）")
+            adj -= 10
+        if nk_price < nk_ma5 and nk_ma5 < nk_ma20:
+            warnings.append("日経がデッドクロス配列（MA5<MA20）")
+            adj -= 8
+
+        # RSI
+        if nk_rsi > 70:
+            warnings.append(f"日経RSI={nk_rsi:.0f}（買われすぎ・調整リスク）")
+            adj -= 6
+        elif nk_rsi < 30:
+            warnings.append(f"日経RSI={nk_rsi:.0f}（売られすぎ・反発期待あるも荒れやすい）")
+            adj -= 5
+        elif 40 <= nk_rsi <= 60:
+            positives.append(f"日経RSI={nk_rsi:.0f}（健全ゾーン）")
+            adj += 3
+
+    # 直近騰落
+    if nk_5d < -3.0:
+        warnings.append(f"日経5日で{nk_5d:.1f}%下落（急落局面）")
+        adj -= 10
+    elif nk_5d < -1.5:
+        warnings.append(f"日経5日で{nk_5d:.1f}%下落（軟調）")
+        adj -= 5
+    elif nk_5d > 2.0:
+        positives.append(f"日経5日で+{nk_5d:.1f}%上昇（強い地合い）")
+        adj += 5
+
+    if nk_20d < -5.0:
+        warnings.append(f"日経20日で{nk_20d:.1f}%下落（中期調整中）")
+        adj -= 8
+    elif nk_20d > 4.0:
+        positives.append(f"日経20日で+{nk_20d:.1f}%上昇（中期上昇トレンド）")
+        adj += 4
+
+    # TOPIX確認（日経と方向感が一致しているか）
+    if result["topix_5d"] < -2.0 and nk_5d < -1.0:
+        warnings.append("TOPIX・日経ともに軟調（広範な売り圧力）")
+        adj -= 5
+    elif result["topix_5d"] > 1.5 and nk_5d > 1.0:
+        positives.append("TOPIX・日経ともに上昇（地合い良好）")
+        adj += 3
+
+    # VIX
+    if vix:
+        result["vix_level"] = "high" if vix > 25 else ("elevated" if vix > 20 else "normal")
+        if vix > 25:
+            warnings.append(f"VIX={vix:.1f}（高水準・市場の恐怖感が強い）")
+            adj -= 12
+        elif vix > 20:
+            warnings.append(f"VIX={vix:.1f}（やや高め・ボラティリティ注意）")
+            adj -= 5
+        else:
+            positives.append(f"VIX={vix:.1f}（低水準・安定した市場環境）")
+            adj += 3
+
+    # ── フェーズ決定 ──
+    total_signals = len(positives) - len(warnings)
+    if adj >= 10 and not warnings:
+        phase, label, color, mult = "bull",      "🟢 強気",    "#3fb950", 1.15
+    elif adj >= 4:
+        phase, label, color, mult = "mild_bull", "🟡 やや強気", "#ffa657", 1.05
+    elif adj >= -3:
+        phase, label, color, mult = "neutral",   "⚪ 中立",     "#8b949e", 1.00
+    elif adj >= -10:
+        phase, label, color, mult = "mild_bear", "🟠 やや弱気", "#f0883e", 0.85
+    else:
+        phase, label, color, mult = "bear",      "🔴 弱気",    "#f85149", 0.70
+
+    result.update({
+        "phase": phase, "phase_label": label, "phase_color": color,
+        "score_multiplier": mult, "score_adj": adj,
+        "warnings": warnings, "positives": positives
+    })
+    return result
+
+# ─── 決算・配当情報の取得 ────────────────────────────────────
+@st.cache_data(ttl=3600)
+def get_earnings_info(ticker_code):
+    """
+    決算予定日・配当落ち日を取得して警告レベルを返す。
+    戻り値: {
+        earnings_date, days_to_earnings, earnings_warning,  # None / "danger" / "caution"
+        ex_div_date,   days_to_ex_div,   div_warning
+    }
+    """
+    info = {
+        "earnings_date": None, "days_to_earnings": None, "earnings_warning": None,
+        "ex_div_date": None,   "days_to_ex_div": None,   "div_warning": None
+    }
+    try:
+        ticker = yf.Ticker(f"{ticker_code}.T")
+        today  = datetime.now().date()
+
+        # 決算日
+        cal = ticker.calendar
+        if cal is not None:
+            if isinstance(cal, dict):
+                eq = cal.get("Earnings Date")
+                if eq:
+                    # リスト or Timestamp
+                    ed = eq[0] if isinstance(eq, list) else eq
+                    if hasattr(ed, 'date'):
+                        ed = ed.date()
+                    elif isinstance(ed, str):
+                        ed = datetime.strptime(ed[:10], "%Y-%m-%d").date()
+                    days = (ed - today).days
+                    if 0 <= days <= 30:
+                        info["earnings_date"]    = ed
+                        info["days_to_earnings"] = days
+                        info["earnings_warning"] = "danger"  if days <= 7  else "caution"
+            elif hasattr(cal, 'T'):
+                # DataFrame形式
+                try:
+                    ed_row = cal.T.get("Earnings Date")
+                    if ed_row is not None:
+                        ed = pd.to_datetime(ed_row.values[0]).date()
+                        days = (ed - today).days
+                        if 0 <= days <= 30:
+                            info["earnings_date"]    = ed
+                            info["days_to_earnings"] = days
+                            info["earnings_warning"] = "danger" if days <= 7 else "caution"
+                except:
+                    pass
+
+        # 配当落ち日
+        try:
+            t_info = ticker.info
+            ex_div = t_info.get("exDividendDate")
+            if ex_div:
+                if isinstance(ex_div, (int, float)):
+                    ex_date = datetime.fromtimestamp(ex_div).date()
+                else:
+                    ex_date = pd.to_datetime(ex_div).date()
+                days = (ex_date - today).days
+                if 0 <= days <= 14:
+                    info["ex_div_date"]   = ex_date
+                    info["days_to_ex_div"] = days
+                    info["div_warning"]   = "caution"
+        except:
+            pass
+
+    except:
+        pass
+    return info
+
+def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     df = fetch_stock_data(ticker_code)
     if df is None or len(df) < 26:
         return None
@@ -422,24 +657,175 @@ def analyze_stock(ticker_code, name):
 
     score += vol_score
 
-    # ─── エントリー・利確・損切りの計算 ──────────────────────
+    # ─── 市場環境スコア加減点（±20点） ──────────────────────
+    market_score_adj = 0
+    market_reasons   = []
+    if market_env:
+        raw_adj = market_env.get("score_adj", 0)
+        # 個別銘柄への影響は市場調整値の60%を加減点（最大±20点に正規化）
+        market_score_adj = max(-20, min(10, int(raw_adj * 0.6)))
+        phase_label = market_env.get("phase_label", "")
+        if market_score_adj > 0:
+            market_reasons.append(f"地合い良好（{phase_label}）+{market_score_adj}pt")
+        elif market_score_adj < 0:
+            market_reasons.append(f"地合い悪化（{phase_label}）{market_score_adj}pt")
+        else:
+            market_reasons.append(f"地合い中立（{phase_label}）")
+    score += market_score_adj
+
+    # ─── 決算・配当ペナルティ ────────────────────────────────
+    earnings_score_adj = 0
+    earnings_warning   = None
+    div_warning        = None
+    days_to_earnings   = None
+    days_to_ex_div     = None
+    if earnings_info:
+        days_to_earnings = earnings_info.get("days_to_earnings")
+        days_to_ex_div   = earnings_info.get("days_to_ex_div")
+        if earnings_info.get("earnings_warning") == "danger":
+            earnings_score_adj -= 20
+            earnings_warning = "danger"
+            reasons.append(f"⚠️ 決算{days_to_earnings}日前（エントリー要注意）")
+        elif earnings_info.get("earnings_warning") == "caution":
+            earnings_score_adj -= 10
+            earnings_warning = "caution"
+            reasons.append(f"📅 決算{days_to_earnings}日前（決算跨ぎリスクあり）")
+        if earnings_info.get("div_warning") == "caution":
+            earnings_score_adj -= 5
+            div_warning = "caution"
+            reasons.append(f"💴 配当落ち{days_to_ex_div}日前（需給変動に注意）")
+    score += earnings_score_adj
+
+    # スコアを0〜100にクランプ
+    score = max(0.0, min(100.0, score))
+
+
     atr = calc_atr(df)
 
-    # エントリー: 現在価格から少し下を狙う（逆指値指し値）
-    entry_price = round(current_price * 0.995, 0)
-    if entry_price == current_price:
-        entry_price = current_price
+    # 直近スウィングハイ・ローを検出（20日）
+    recent = df.tail(20)
+    swing_lows, swing_highs = [], []
+    lows = recent['Low'].values
+    highs = recent['High'].values
+    for idx in range(1, len(lows) - 1):
+        if lows[idx] < lows[idx-1] and lows[idx] < lows[idx+1]:
+            swing_lows.append(lows[idx])
+        if highs[idx] > highs[idx-1] and highs[idx] > highs[idx+1]:
+            swing_highs.append(highs[idx])
 
-    # 利確: ATRの2倍（スイングの期待値）
-    take_profit = round(entry_price + atr * 2.5, 0)
+    # 現在値より下の最も近いサポート、上の最も近いレジスタンスを選ぶ
+    nearest_support = max(
+        [v for v in swing_lows if v < current_price],
+        default=current_price - atr * 1.5
+    )
+    nearest_resistance = min(
+        [v for v in swing_highs if v > current_price],
+        default=current_price + atr * 3.0
+    )
+    recent_5d_low = df['Low'].tail(5).min()
+
+    # ─── エントリー戦略の自動選択 ────────────────────────────
+    # 戦略A: 押し目買い（トレンドフォロー）
+    #   条件: MAパーフェクトオーダー or MA5>MA20、かつ現値がMA5またはMA20の±1ATR圧内
+    dist_to_ma5  = abs(current_price - ma5)
+    dist_to_ma20 = abs(current_price - ma20)
+    near_ma5  = dist_to_ma5  < atr * 0.5
+    near_ma20 = dist_to_ma20 < atr * 0.8
+    trend_up = (ma5 > ma20) and (current_price > ma20)
+
+    # 戦略B: BB下限反発（逆張り）
+    #   条件: BB位置が20%以下、RSIが50以下で上向き
+    strategy_b = (bb_pct < 0.25) and (rsi_now < 55) and (rsi_now > rsi_prev)
+
+    # 戦略C: サポートライン反発
+    #   条件: 現値がスウィングローの±ATR*0.3圏内
+    near_support = abs(current_price - nearest_support) < atr * 0.4
+
+    # 戦略D: ブレイクアウト
+    #   条件: 出来高急増(1.8倍以上) + MACDヒストグラム拡大 + 現値がMA20を明確に上抜け
+    breakout = (
+        vol_ratio >= 1.8 and
+        macd_hist_now > macd_hist_prev and
+        macd_hist_now > 0 and
+        current_price > ma20 * 1.005
+    )
+
+    # 戦略の優先順位: D > A(MA5) > A(MA20) > B > C > デフォルト
+    if breakout:
+        strategy_type = "D"
+        strategy_label = "ブレイクアウト買い"
+        strategy_desc  = f"出来高{vol_ratio:.1f}倍・MACD拡大・MA20上抜け → 勢い乗り"
+        # ブレイク直後は現値より少し上で確認買い
+        entry_price  = round(current_price * 1.002, 0)
+        # 損切: MA20を割り込んだら即撤退
+        stop_loss    = round(max(ma20 * 0.997, entry_price - atr * 1.0), 0)
+        # 利確: 直近レジスタンスかATR×3.0
+        take_profit  = round(min(nearest_resistance * 0.998,
+                                  entry_price + atr * 3.0), 0)
+
+    elif trend_up and near_ma5:
+        strategy_type = "A1"
+        strategy_label = "押し目買い（MA5タッチ）"
+        strategy_desc  = f"上昇トレンド中のMA5({ma5:,.0f})押し目 → 反発狙い"
+        # MA5より少し上で指値（タッチからの反発確認）
+        entry_price  = round(ma5 * 1.001, 0)
+        stop_loss    = round(ma5 - atr * 0.8, 0)
+        take_profit  = round(min(nearest_resistance * 0.998,
+                                  entry_price + atr * 2.5), 0)
+
+    elif trend_up and near_ma20:
+        strategy_type = "A2"
+        strategy_label = "押し目買い（MA20タッチ）"
+        strategy_desc  = f"上昇トレンド中のMA20({ma20:,.0f})押し目 → 中期線反発"
+        entry_price  = round(ma20 * 1.001, 0)
+        stop_loss    = round(ma20 - atr * 1.0, 0)
+        take_profit  = round(min(nearest_resistance * 0.998,
+                                  entry_price + atr * 3.0), 0)
+
+    elif strategy_b:
+        strategy_type = "B"
+        strategy_label = "BB下限反発（逆張り）"
+        strategy_desc  = f"BBバンド下限({bb_lower_now:,.0f})付近・RSI{rsi_now:.0f}で反発兆候"
+        # BB下限より少し上で指値
+        entry_price  = round(bb_lower_now * 1.002, 0)
+        stop_loss    = round(bb_lower_now - atr * 0.5, 0)
+        # 利確: BB中央線（MA20）を第1目標、BB上限を第2目標
+        take_profit  = round(bb_mid.iloc[-1], 0)
+
+    elif near_support:
+        strategy_type = "C"
+        strategy_label = "サポートライン反発"
+        strategy_desc  = f"直近サポート({nearest_support:,.0f})タッチ → 水平線反発"
+        entry_price  = round(nearest_support * 1.003, 0)
+        stop_loss    = round(nearest_support * 0.990, 0)
+        take_profit  = round(min(nearest_resistance * 0.998,
+                                  entry_price + atr * 2.5), 0)
+
+    else:
+        # デフォルト: ATRベース（明確な戦略シグナルなし）
+        strategy_type = "ATR"
+        strategy_label = "ATRベース（標準）"
+        strategy_desc  = "特定パターン未検出。ATR基準の標準エントリー"
+        entry_price  = round(current_price * 0.997, 0)
+        stop_loss    = round(entry_price - atr * 1.0, 0)
+        take_profit  = round(entry_price + atr * 2.5, 0)
+
+    # エントリー価格が現在値より大幅に乖離していたら補正
+    if entry_price > current_price * 1.03:
+        entry_price = round(current_price * 1.002, 0)
+    if entry_price < current_price * 0.97:
+        entry_price = round(current_price * 0.997, 0)
+
+    # 損切りが現在値より上になるバグ防止
+    if stop_loss >= entry_price:
+        stop_loss = round(entry_price - atr * 1.0, 0)
+    # 利確が現在値より下になるバグ防止
+    if take_profit <= entry_price:
+        take_profit = round(entry_price + atr * 2.5, 0)
+
     profit_pct = (take_profit / entry_price - 1) * 100
-
-    # 損切り: ATRの1倍（リスクリワード1:2.5以上を確保）
-    stop_loss = round(entry_price - atr * 1.0, 0)
-    loss_pct = (stop_loss / entry_price - 1) * 100
-
-    # リスクリワード比
-    rr_ratio = profit_pct / abs(loss_pct) if loss_pct != 0 else 0
+    loss_pct   = (stop_loss  / entry_price - 1) * 100
+    rr_ratio   = profit_pct / abs(loss_pct) if loss_pct != 0 else 0
 
     return {
         "code": ticker_code,
@@ -454,9 +840,20 @@ def analyze_stock(ticker_code, name):
         "score": round(score, 1),
         "signals": signals,
         "reasons": reasons,
+        "market_reasons": market_reasons,
+        "market_score_adj": market_score_adj,
+        "earnings_warning": earnings_warning,
+        "div_warning": div_warning,
+        "days_to_earnings": days_to_earnings,
+        "days_to_ex_div": days_to_ex_div,
+        "strategy_type": strategy_type,
+        "strategy_label": strategy_label,
+        "strategy_desc": strategy_desc,
         "rsi": rsi_now,
+        "rsi_prev": rsi_prev,
         "macd_hist": macd_hist_now,
         "bb_pct": bb_pct,
+        "bb_lower": bb_lower_now,
         "vol_ratio": vol_ratio,
         "pct_1d": pct_1d,
         "pct_5d": pct_5d,
@@ -464,6 +861,8 @@ def analyze_stock(ticker_code, name):
         "ma5": ma5,
         "ma20": ma20,
         "ma60": ma60,
+        "nearest_support": nearest_support,
+        "nearest_resistance": nearest_resistance,
         "df": df
     }
 
@@ -480,19 +879,120 @@ def calc_atr(df, period=14):
 # ─── ランキング計算 ───────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def compute_rankings(_progress_callback=None):
-    results = []
-    tickers = list(NIKKEI225_TICKERS.items())
+    results  = []
+    tickers  = list(NIKKEI225_TICKERS.items())
 
-    progress_bar = st.progress(0, text="銘柄データを取得中...")
+    # 市場環境を先に1回だけ取得
+    progress_bar = st.progress(0, text="市場環境を分析中...")
+    market_env   = calc_market_environment()
+
     for i, (code, name) in enumerate(tickers):
-        progress_bar.progress((i + 1) / len(tickers), text=f"分析中: {name} ({code})")
-        result = analyze_stock(code, name)
+        progress_bar.progress(
+            (i + 1) / len(tickers),
+            text=f"分析中: {name} ({code})"
+        )
+        # 決算・配当情報取得
+        earnings_info = get_earnings_info(code)
+        result = analyze_stock(code, name,
+                               market_env=market_env,
+                               earnings_info=earnings_info)
         if result:
             results.append(result)
 
     progress_bar.empty()
     results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:20]
+    return results[:20], market_env
+
+def show_market_environment(env):
+    """ランキングページ上部に市場環境バナーを表示"""
+    if not env:
+        return
+    phase_color = env.get("phase_color", "#8b949e")
+    phase_label = env.get("phase_label", "不明")
+    nk_price    = env.get("nk_price")
+    nk_1d       = env.get("nk_1d", 0.0)
+    nk_5d       = env.get("nk_5d", 0.0)
+    nk_rsi      = env.get("nk_rsi", 0.0)
+    vix         = env.get("vix")
+    vix_level   = env.get("vix_level", "normal")
+    topix_5d    = env.get("topix_5d", 0.0)
+    warnings    = env.get("warnings", [])
+    positives   = env.get("positives", [])
+    score_adj   = env.get("score_adj", 0)
+
+    nk_1d_color  = "#3fb950" if nk_1d  >= 0 else "#f85149"
+    nk_5d_color  = "#3fb950" if nk_5d  >= 0 else "#f85149"
+    tp_5d_color  = "#3fb950" if topix_5d >= 0 else "#f85149"
+    vix_color    = "#f85149" if vix_level == "high" else ("#f0883e" if vix_level == "elevated" else "#3fb950")
+    adj_color    = "#3fb950" if score_adj >= 0 else "#f85149"
+    adj_sign     = "+" if score_adj >= 0 else ""
+
+    nk_str  = f"¥{nk_price:,.0f}" if nk_price else "---"
+    vix_str = f"{vix:.1f}"        if vix      else "---"
+
+    warn_html = "".join([
+        f'<div style="color:#f85149; font-size:0.78rem; margin:2px 0;">⚠️ {w}</div>'
+        for w in warnings
+    ])
+    pos_html = "".join([
+        f'<div style="color:#3fb950; font-size:0.78rem; margin:2px 0;">✅ {p}</div>'
+        for p in positives
+    ])
+
+    st.markdown(f"""
+    <div style="background:#161b22; border:1px solid {phase_color};
+                border-radius:12px; padding:18px 24px; margin-bottom:18px;">
+        <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
+            <div>
+                <span style="font-size:1.1rem; font-weight:700; color:{phase_color};">{phase_label}</span>
+                <span style="color:#8b949e; font-size:0.8rem; margin-left:10px;">現在の市場環境</span>
+            </div>
+            <div style="text-align:right;">
+                <span style="color:#8b949e; font-size:0.75rem;">全銘柄スコア補正：</span>
+                <span style="color:{adj_color}; font-weight:700; font-family:'JetBrains Mono',monospace;">
+                    {adj_sign}{score_adj}pt
+                </span>
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:12px;
+                    font-family:'JetBrains Mono',monospace; font-size:0.82rem; margin-bottom:14px;">
+            <div>
+                <div style="color:#8b949e; font-size:0.7rem; letter-spacing:1px;">日経225</div>
+                <div style="color:#f0f6fc; font-weight:700;">{nk_str}</div>
+            </div>
+            <div>
+                <div style="color:#8b949e; font-size:0.7rem; letter-spacing:1px;">日経 前日比</div>
+                <div style="color:{nk_1d_color}; font-weight:700;">
+                    {"+" if nk_1d >= 0 else ""}{nk_1d:.2f}%
+                </div>
+            </div>
+            <div>
+                <div style="color:#8b949e; font-size:0.7rem; letter-spacing:1px;">日経 5日</div>
+                <div style="color:{nk_5d_color}; font-weight:700;">
+                    {"+" if nk_5d >= 0 else ""}{nk_5d:.2f}%
+                </div>
+            </div>
+            <div>
+                <div style="color:#8b949e; font-size:0.7rem; letter-spacing:1px;">日経 RSI</div>
+                <div style="color:#d2a8ff; font-weight:700;">{nk_rsi:.1f}</div>
+            </div>
+            <div>
+                <div style="color:#8b949e; font-size:0.7rem; letter-spacing:1px;">VIX</div>
+                <div style="color:{vix_color}; font-weight:700;">{vix_str}</div>
+            </div>
+        </div>
+        <div style="display:grid; grid-template-columns:1fr 1fr; gap:12px;">
+            <div style="background:#0d1117; border-radius:8px; padding:10px;">
+                <div style="color:#8b949e; font-size:0.7rem; margin-bottom:6px; letter-spacing:1px;">⚠️ 懸念事項</div>
+                {warn_html if warn_html else '<div style="color:#8b949e;font-size:0.78rem;">特になし</div>'}
+            </div>
+            <div style="background:#0d1117; border-radius:8px; padding:10px;">
+                <div style="color:#8b949e; font-size:0.7rem; margin-bottom:6px; letter-spacing:1px;">✅ ポジティブ要因</div>
+                {pos_html if pos_html else '<div style="color:#8b949e;font-size:0.78rem;">特になし</div>'}
+            </div>
+        </div>
+    </div>
+    """, unsafe_allow_html=True)
 
 # ─── チャート描画 ─────────────────────────────────────────────
 def draw_chart(stock_data):
@@ -841,6 +1341,8 @@ def main():
         st.session_state.rankings_loaded = False
     if "rankings_data" not in st.session_state:
         st.session_state.rankings_data = []
+    if "market_env_data" not in st.session_state:
+        st.session_state.market_env_data = {}
 
     # ヘッダー
     st.markdown("""
@@ -879,8 +1381,10 @@ def main():
         st.markdown("---")
         if st.button("🔄 ランキング更新", use_container_width=True):
             compute_rankings.clear()
-            st.session_state.rankings_loaded = False
-            st.session_state.rankings_data = []
+            calc_market_environment.clear()
+            st.session_state.rankings_loaded  = False
+            st.session_state.rankings_data    = []
+            st.session_state.market_env_data  = {}
             st.rerun()
 
     if "ランキング" in page:
@@ -900,13 +1404,18 @@ def main():
             with col2:
                 if st.button("📈 ランキングを取得する", use_container_width=True):
                     with st.spinner("銘柄データを取得・分析中...（しばらくお待ちください）"):
-                        rankings = compute_rankings()
-                    st.session_state.rankings_data = rankings
+                        rankings, market_env = compute_rankings()
+                    st.session_state.rankings_data   = rankings
+                    st.session_state.market_env_data = market_env
                     st.session_state.rankings_loaded = True
                     st.rerun()
             return
 
-        rankings = st.session_state.rankings_data
+        rankings   = st.session_state.rankings_data
+        market_env = st.session_state.get("market_env_data", {})
+
+        # 市場環境バナー
+        show_market_environment(market_env)
 
         # フィルタリング
         filtered = [r for r in rankings if r['score'] >= min_score and r['rr_ratio'] >= min_rr]
@@ -927,7 +1436,46 @@ def main():
                 f'<span class="signal-tag tag-buy">{s}</span>' for s in stock['signals'][:3]
             ])
 
-            pct_color = "#3fb950" if stock['pct_1d'] >= 0 else "#f85149"
+            # 戦略タイプのバッジ色
+            stype = stock.get('strategy_type', 'ATR')
+            strat_colors = {
+                "D":   ("#ff9500", "#3a2500", "🚀"),
+                "A1":  ("#79c0ff", "#0d2a45", "📐"),
+                "A2":  ("#79c0ff", "#0d2a45", "📐"),
+                "B":   ("#d2a8ff", "#2a1a45", "↩️"),
+                "C":   ("#3fb950", "#0d2a1a", "🏗️"),
+                "ATR": ("#8b949e", "#21262d", "📊"),
+            }
+            sc, sbg, sicon = strat_colors.get(stype, strat_colors["ATR"])
+            strategy_badge = f'<span style="background:{sbg};color:{sc};border:1px solid {sc};padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;font-family:\'JetBrains Mono\',monospace;">{sicon} {stock.get("strategy_label","")}</span>'
+
+            # 決算・配当・地合いバッジ生成
+            ew = stock.get("earnings_warning")
+            dw = stock.get("div_warning")
+            dte = stock.get("days_to_earnings")
+            dtd = stock.get("days_to_ex_div")
+            madj = stock.get("market_score_adj", 0)
+
+            if ew == "danger":
+                earnings_badge_html = f'<span style="background:#4a0d0d;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">🚨 決算{dte}日前・エントリー危険</span>'
+            elif ew == "caution":
+                earnings_badge_html = f'<span style="background:#3a2500;color:#ffa657;border:1px solid #f0883e;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">⚠️ 決算{dte}日前・要注意</span>'
+            else:
+                earnings_badge_html = ""
+
+            if dw == "caution":
+                div_badge_html = f'<span style="background:#1a2a3a;color:#79c0ff;border:1px solid #388bfd;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">💴 配当落ち{dtd}日前</span>'
+            else:
+                div_badge_html = ""
+
+            if madj > 0:
+                market_adj_html = f'<span style="background:#0d2a1a;color:#3fb950;border:1px solid #238636;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">📈 地合いボーナス +{madj}pt</span>'
+            elif madj < 0:
+                market_adj_html = f'<span style="background:#2a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">📉 地合いペナルティ {madj}pt</span>'
+            else:
+                market_adj_html = ""
+
+
             pct5_color = "#3fb950" if stock['pct_5d'] >= 0 else "#f85149"
             sign1d = "+" if stock['pct_1d'] >= 0 else ""
             sign5d = "+" if stock['pct_5d'] >= 0 else ""
@@ -954,8 +1502,16 @@ def main():
                     <div><div class="order-label">損切ライン</div><div class="order-loss">¥{stock['stop_loss']:,.0f} ({stock['loss_pct']:.1f}%)</div></div>
                     <div><div class="order-label">RR比</div><div style="color:#ffa657; font-weight:600;">1:{stock['rr_ratio']:.1f}</div></div>
                 </div>
-                <div style="margin:8px 0;">{signals_html}</div>
-                <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:10px; font-size:0.78rem; color:#8b949e;">
+                <div style="margin:8px 0;">{strategy_badge}&nbsp;&nbsp;{signals_html}</div>
+                <div style="margin:4px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
+                    {earnings_badge_html}
+                    {div_badge_html}
+                    {market_adj_html}
+                </div>
+                <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:8px; font-size:0.78rem; color:#8b949e;">
+                    <strong style="color:#f0f6fc;">🎯 エントリー根拠：</strong><span style="color:{sc};">{stock.get('strategy_desc','')}</span>
+                </div>
+                <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:6px; font-size:0.78rem; color:#8b949e;">
                     <strong style="color:#f0f6fc;">📊 スコア解説：</strong>
                     {'　|　'.join(stock['reasons'][:4])}
                 </div>
