@@ -1487,49 +1487,65 @@ def main():
             stock_name    = stock['name']
             stock_code    = stock['code']
 
-            st.markdown(f"""
-            <div class="rank-card {card_class}">
-                <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">
-                    <div style="display:flex; align-items:center; gap:12px;">
-                        <span style="font-size:1.4rem;">{rank_icon}</span>
-                        <div>
-                            <div style="color:#f0f6fc; font-weight:700; font-size:1rem;">{stock_name}</div>
-                            <div style="color:#8b949e; font-size:0.75rem;">東証プライム / {stock_code}</div>
-                        </div>
-                    </div>
-                    <div style="text-align:right;">
-                        <div style="color:#ffa657; font-size:1.6rem; font-weight:700; font-family:'JetBrains Mono',monospace;">{stock['score']:.0f}<span style="font-size:0.8rem;color:#8b949e;">/100</span></div>
-                        <div class="score-bar-bg"><div class="score-bar-fill" style="width:{score_pct}%;"></div></div>
-                    </div>
-                </div>
-                <div style="display:grid; grid-template-columns:repeat(5,1fr); gap:10px; margin:10px 0; font-family:'JetBrains Mono',monospace; font-size:0.82rem;">
-                    <div><div class="order-label">現在値</div><div style="color:#f0f6fc; font-weight:600;">¥{stock['current_price']:,.0f}</div></div>
-                    <div><div class="order-label">エントリー</div><div class="order-entry">¥{stock['entry_price']:,.0f}</div></div>
-                    <div><div class="order-label">利確目標</div><div class="order-profit">¥{stock['take_profit']:,.0f} (+{stock['profit_pct']:.1f}%)</div></div>
-                    <div><div class="order-label">損切ライン</div><div class="order-loss">¥{stock['stop_loss']:,.0f} ({stock['loss_pct']:.1f}%)</div></div>
-                    <div><div class="order-label">RR比</div><div style="color:#ffa657; font-weight:600;">1:{stock['rr_ratio']:.1f}</div></div>
-                </div>
-                <div style="margin:8px 0;">{strategy_badge}&nbsp;&nbsp;{signals_html}</div>
-                <div style="margin:4px 0; display:flex; flex-wrap:wrap; gap:6px; align-items:center;">
-                    {earnings_badge_html}
-                    {div_badge_html}
-                    {market_adj_html}
-                </div>
-                <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:8px; font-size:0.78rem; color:#8b949e;">
-                    <strong style="color:#f0f6fc;">🎯 エントリー根拠：</strong><span style="color:{sc};">{strategy_desc}</span>
-                </div>
-                <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:6px; font-size:0.78rem; color:#8b949e;">
-                    <strong style="color:#f0f6fc;">📊 スコア解説：</strong>{reasons_str}
-                </div>
-                <div style="margin-top:8px; font-size:0.75rem; display:flex; gap:16px;">
-                    <span>1日: <b style="color:{pct_color};">{sign1d}{stock['pct_1d']:.1f}%</b></span>
-                    <span>5日: <b style="color:{pct5_color};">{sign5d}{stock['pct_5d']:.1f}%</b></span>
-                    <span>RSI: <b style="color:#d2a8ff;">{stock['rsi']:.1f}</b></span>
-                    <span>BB位置: <b style="color:#79c0ff;">{stock['bb_pct']:.0%}</b></span>
-                    <span>出来高比: <b style="color:#ffa657;">{stock['vol_ratio']:.1f}x</b></span>
-                </div>
-            </div>
-            """, unsafe_allow_html=True)
+            # f-string内にHTML変数を混ぜるとレンダラーが壊れるため
+            # 文字列連結でHTMLを組み立てる
+            score_int     = int(stock['score'])
+            cur_price_str = f"¥{stock['current_price']:,.0f}"
+            entry_str     = f"¥{stock['entry_price']:,.0f}"
+            tp_str        = f"¥{stock['take_profit']:,.0f} (+{stock['profit_pct']:.1f}%)"
+            sl_str        = f"¥{stock['stop_loss']:,.0f} ({stock['loss_pct']:.1f}%)"
+            rr_str        = f"1:{stock['rr_ratio']:.1f}"
+            rsi_str       = f"{stock['rsi']:.1f}"
+            bb_pct_str    = f"{stock['bb_pct']:.0%}"
+            vol_str       = f"{stock['vol_ratio']:.1f}x"
+            pct1d_str     = f"{sign1d}{stock['pct_1d']:.1f}%"
+            pct5d_str     = f"{sign5d}{stock['pct_5d']:.1f}%"
+
+            card_html = (
+                '<div class="rank-card ' + card_class + '">'
+                + '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
+                +   '<div style="display:flex;align-items:center;gap:12px;">'
+                +     '<span style="font-size:1.4rem;">' + rank_icon + '</span>'
+                +     '<div>'
+                +       '<div style="color:#f0f6fc;font-weight:700;font-size:1rem;">' + stock_name + '</div>'
+                +       '<div style="color:#8b949e;font-size:0.75rem;">東証プライム / ' + stock_code + '</div>'
+                +     '</div>'
+                +   '</div>'
+                +   '<div style="text-align:right;">'
+                +     '<div style="color:#ffa657;font-size:1.6rem;font-weight:700;font-family:JetBrains Mono,monospace;">'
+                +       str(score_int) + '<span style="font-size:0.8rem;color:#8b949e;">/100</span>'
+                +     '</div>'
+                +     '<div class="score-bar-bg"><div class="score-bar-fill" style="width:' + str(score_int) + '%;"></div></div>'
+                +   '</div>'
+                + '</div>'
+                + '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:10px 0;font-family:JetBrains Mono,monospace;font-size:0.82rem;">'
+                +   '<div><div class="order-label">現在値</div><div style="color:#f0f6fc;font-weight:600;">' + cur_price_str + '</div></div>'
+                +   '<div><div class="order-label">エントリー</div><div class="order-entry">' + entry_str + '</div></div>'
+                +   '<div><div class="order-label">利確目標</div><div class="order-profit">' + tp_str + '</div></div>'
+                +   '<div><div class="order-label">損切ライン</div><div class="order-loss">' + sl_str + '</div></div>'
+                +   '<div><div class="order-label">RR比</div><div style="color:#ffa657;font-weight:600;">' + rr_str + '</div></div>'
+                + '</div>'
+                + '<div style="margin:8px 0;">' + strategy_badge + '&nbsp;&nbsp;' + signals_html + '</div>'
+                + '<div style="margin:4px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'
+                +   earnings_badge_html + div_badge_html + market_adj_html
+                + '</div>'
+                + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:8px;font-size:0.78rem;color:#8b949e;">'
+                +   '<strong style="color:#f0f6fc;">&#127919; エントリー根拠：</strong>'
+                +   '<span style="color:' + sc + ';">' + strategy_desc + '</span>'
+                + '</div>'
+                + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:6px;font-size:0.78rem;color:#8b949e;">'
+                +   '<strong style="color:#f0f6fc;">&#128202; スコア解説：</strong>' + reasons_str
+                + '</div>'
+                + '<div style="margin-top:8px;font-size:0.75rem;display:flex;gap:16px;">'
+                +   '<span>1日: <b style="color:' + pct_color + ';">' + pct1d_str + '</b></span>'
+                +   '<span>5日: <b style="color:' + pct5_color + ';">' + pct5d_str + '</b></span>'
+                +   '<span>RSI: <b style="color:#d2a8ff;">' + rsi_str + '</b></span>'
+                +   '<span>BB位置: <b style="color:#79c0ff;">' + bb_pct_str + '</b></span>'
+                +   '<span>出来高比: <b style="color:#ffa657;">' + vol_str + '</b></span>'
+                + '</div>'
+                + '</div>'
+            )
+            st.markdown(card_html, unsafe_allow_html=True)
 
             # チャートとIFDOCO注文
             with st.expander(f"📈 {stock['name']} の詳細チャート・IFDOCO注文"):
