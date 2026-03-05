@@ -1481,14 +1481,20 @@ def main():
             sign1d = "+" if stock['pct_1d'] >= 0 else ""
             sign5d = "+" if stock['pct_5d'] >= 0 else ""
 
+            # f-string内で式を使うとHTML描画が壊れるため全て事前に変数化
+            reasons_str   = "　|　".join(stock['reasons'][:4])
+            strategy_desc = stock.get('strategy_desc', '')
+            stock_name    = stock['name']
+            stock_code    = stock['code']
+
             st.markdown(f"""
             <div class="rank-card {card_class}">
                 <div style="display:flex; justify-content:space-between; align-items:flex-start; margin-bottom:10px;">
                     <div style="display:flex; align-items:center; gap:12px;">
                         <span style="font-size:1.4rem;">{rank_icon}</span>
                         <div>
-                            <div style="color:#f0f6fc; font-weight:700; font-size:1rem;">{stock['name']}</div>
-                            <div style="color:#8b949e; font-size:0.75rem;">東証プライム / {stock['code']}</div>
+                            <div style="color:#f0f6fc; font-weight:700; font-size:1rem;">{stock_name}</div>
+                            <div style="color:#8b949e; font-size:0.75rem;">東証プライム / {stock_code}</div>
                         </div>
                     </div>
                     <div style="text-align:right;">
@@ -1510,11 +1516,10 @@ def main():
                     {market_adj_html}
                 </div>
                 <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:8px; font-size:0.78rem; color:#8b949e;">
-                    <strong style="color:#f0f6fc;">🎯 エントリー根拠：</strong><span style="color:{sc};">{stock.get('strategy_desc','')}</span>
+                    <strong style="color:#f0f6fc;">🎯 エントリー根拠：</strong><span style="color:{sc};">{strategy_desc}</span>
                 </div>
                 <div style="background:#0d1117; border-radius:6px; padding:10px; margin-top:6px; font-size:0.78rem; color:#8b949e;">
-                    <strong style="color:#f0f6fc;">📊 スコア解説：</strong>
-                    {'　|　'.join(stock['reasons'][:4])}
+                    <strong style="color:#f0f6fc;">📊 スコア解説：</strong>{reasons_str}
                 </div>
                 <div style="margin-top:8px; font-size:0.75rem; display:flex; gap:16px;">
                     <span>1日: <b style="color:{pct_color};">{sign1d}{stock['pct_1d']:.1f}%</b></span>
