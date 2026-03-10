@@ -540,6 +540,26 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     pct_5d = (close.iloc[-1] / close.iloc[-5] - 1) * 100 if len(close) >= 5 else 0
     pct_20d = (close.iloc[-1] / close.iloc[-20] - 1) * 100 if len(close) >= 20 else 0
 
+    # ─── ATR・サポート・レジスタンス（スコアリング前に算出） ──
+    atr = calc_atr(df)
+    recent_sw = df.tail(20)
+    swing_lows, swing_highs = [], []
+    for idx in range(1, len(recent_sw) - 1):
+        lv = recent_sw['Low'].values
+        hv = recent_sw['High'].values
+        if lv[idx] < lv[idx-1] and lv[idx] < lv[idx+1]:
+            swing_lows.append(lv[idx])
+        if hv[idx] > hv[idx-1] and hv[idx] > hv[idx+1]:
+            swing_highs.append(hv[idx])
+    nearest_support = max(
+        [v for v in swing_lows if v < current_price],
+        default=current_price - atr * 1.5
+    )
+    nearest_resistance = min(
+        [v for v in swing_highs if v > current_price],
+        default=current_price + atr * 3.0
+    )
+
     # ─── スコアリング（100点満点） ──────────────────────────
     score = 0
     signals = []
@@ -657,7 +677,30 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
 
     score += vol_score
 
-    # ─── 市場環境スコア加減点（±20点） ──────────────────────
+    # ─── ローソク足パターン認識（±15点） ────────────────────
+    candle_result   = detect_candlestick_patterns(
+        df,
+        bb_pct            = bb_pct,
+        ma5               = ma5,
+        ma25              = ma25,
+        ma75              = ma75,
+        nearest_support   = nearest_support,
+        nearest_resistance= nearest_resistance,
+        current_price     = current_price,
+    )
+    candle_bonus    = candle_result["score_bonus"]
+    candle_patterns = candle_result["patterns"]
+    candle_signals  = candle_result["signals"]
+    candle_notes    = candle_result.get("context_notes", [])
+    if candle_patterns:
+        signals.extend(candle_signals[:2])
+        if candle_bonus > 0:
+            reasons.append(f"ローソク足: {', '.join(candle_patterns)}（強気 +{candle_bonus}pt）")
+        elif candle_bonus < 0:
+            reasons.append(f"ローソク足: {', '.join(candle_patterns)}（弱気 {candle_bonus}pt）")
+    score += candle_bonus
+
+
     market_score_adj = 0
     market_reasons   = []
     if market_env:
@@ -699,29 +742,6 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     # スコアを0〜100にクランプ
     score = max(0.0, min(100.0, score))
 
-
-    atr = calc_atr(df)
-
-    # 直近スウィングハイ・ローを検出（20日）
-    recent = df.tail(20)
-    swing_lows, swing_highs = [], []
-    lows = recent['Low'].values
-    highs = recent['High'].values
-    for idx in range(1, len(lows) - 1):
-        if lows[idx] < lows[idx-1] and lows[idx] < lows[idx+1]:
-            swing_lows.append(lows[idx])
-        if highs[idx] > highs[idx-1] and highs[idx] > highs[idx+1]:
-            swing_highs.append(highs[idx])
-
-    # 現在値より下の最も近いサポート、上の最も近いレジスタンスを選ぶ
-    nearest_support = max(
-        [v for v in swing_lows if v < current_price],
-        default=current_price - atr * 1.5
-    )
-    nearest_resistance = min(
-        [v for v in swing_highs if v > current_price],
-        default=current_price + atr * 3.0
-    )
     recent_5d_low = df['Low'].tail(5).min()
 
     # ─── エントリー戦略の自動選択 ────────────────────────────
@@ -827,6 +847,9 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     loss_pct   = (stop_loss  / entry_price - 1) * 100
     rr_ratio   = profit_pct / abs(loss_pct) if loss_pct != 0 else 0
 
+    # 流動性計算（売買代金）
+    daily_value = float(volume.iloc[-1]) * float(close.iloc[-1])  # 直近日の売買代金（円）
+
     return {
         "code": ticker_code,
         "name": name,
@@ -846,6 +869,9 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         "div_warning": div_warning,
         "days_to_earnings": days_to_earnings,
         "days_to_ex_div": days_to_ex_div,
+        "candle_patterns": candle_patterns,
+        "candle_bonus": candle_bonus,
+        "candle_notes": candle_notes,
         "strategy_type": strategy_type,
         "strategy_label": strategy_label,
         "strategy_desc": strategy_desc,
@@ -855,6 +881,7 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         "bb_pct": bb_pct,
         "bb_lower": bb_lower_now,
         "vol_ratio": vol_ratio,
+        "daily_value": daily_value,
         "pct_1d": pct_1d,
         "pct_5d": pct_5d,
         "pct_20d": pct_20d,
@@ -875,6 +902,292 @@ def calc_atr(df, period=14):
     tr3 = abs(low - close.shift())
     tr = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
     return tr.rolling(period).mean().iloc[-1]
+
+# ─── ローソク足パターン認識（文脈考慮版） ────────────────────
+def detect_candlestick_patterns(df, bb_pct=0.5, ma5=None, ma25=None, ma75=None,
+                                  nearest_support=None, nearest_resistance=None,
+                                  current_price=None):
+    """
+    直近3本のローソク足から主要パターンを検出し、
+    「どこで出たか（価格帯・トレンド文脈）」によってスコアを補正する。
+
+    文脈の定義:
+      at_low       : BB位置 < 25%  → 安値圏（反発期待が高い）
+      at_high      : BB位置 > 75%  → 高値圏（反転リスクが高い）
+      in_uptrend   : MA5 > MA25 > MA75
+      in_downtrend : MA5 < MA25
+      near_support : 現値がサポートラインの±ATR*0.5以内
+
+    同じパターンでも文脈によって加点・減点・中立が変わる。
+    """
+    result = {"patterns": [], "score_bonus": 0, "signals": [], "bullish": False, "context_notes": []}
+    if len(df) < 3:
+        return result
+
+    # ── OHLC取得 ────────────────────────────────────────────
+    o1, h1, l1, c1 = df['Open'].iloc[-3], df['High'].iloc[-3], df['Low'].iloc[-3], df['Close'].iloc[-3]
+    o2, h2, l2, c2 = df['Open'].iloc[-2], df['High'].iloc[-2], df['Low'].iloc[-2], df['Close'].iloc[-2]
+    o3, h3, l3, c3 = df['Open'].iloc[-1], df['High'].iloc[-1], df['Low'].iloc[-1], df['Close'].iloc[-1]
+
+    atr = calc_atr(df)
+    if atr == 0:
+        return result
+
+    body3  = abs(c3 - o3)
+    upper3 = h3 - max(c3, o3)
+    lower3 = min(c3, o3) - l3
+    body2  = abs(c2 - o2)
+    body1  = abs(c1 - o1)
+    range3 = h3 - l3
+
+    is_bull3 = c3 > o3
+    is_bear3 = c3 < o3
+    is_bull2 = c2 > o2
+    is_bear2 = c2 < o2
+    is_bull1 = c1 > o1
+    is_bear1 = c1 < o1
+
+    # ── 文脈フラグ ───────────────────────────────────────────
+    at_low    = bb_pct < 0.25                         # BB下位25%（安値圏）
+    at_mid    = 0.25 <= bb_pct <= 0.75                # BB中間帯
+    at_high   = bb_pct > 0.75                         # BB上位25%（高値圏）
+    at_extreme_high = bb_pct > 0.88                   # BB最上部（危険域）
+
+    in_uptrend   = (ma5 and ma25 and ma75 and ma5 > ma25 > ma75)
+    in_downtrend = (ma5 and ma25 and ma5 < ma25)
+    after_decline = (c1 < o1 and c2 < o2)            # 2日連続陰線後
+
+    near_sup = False
+    if nearest_support and current_price:
+        near_sup = abs(current_price - nearest_support) < atr * 0.6
+
+    near_res = False
+    if nearest_resistance and current_price:
+        near_res = abs(current_price - nearest_resistance) < atr * 0.6
+
+    patterns      = []
+    score_bonus   = 0
+    signals       = []
+    context_notes = []
+
+    # ════════════════════════════════════════════════════════
+    # ① 陽の丸坊主（実体≥値幅85%、上下ヒゲなし）
+    # ════════════════════════════════════════════════════════
+    if is_bull3 and body3 >= range3 * 0.85 and range3 > atr * 0.5:
+        patterns.append("陽の丸坊主")
+        signals.append("陽の丸坊主")
+        if at_low or (after_decline and not at_high):
+            score_bonus += 13
+            context_notes.append("陽の丸坊主：安値圏・下落後 → 強い転換シグナル")
+        elif at_high and in_uptrend:
+            score_bonus += 5
+            context_notes.append("陽の丸坊主：高値圏 → トレンド継続だが過熱感に注意")
+        elif at_extreme_high:
+            score_bonus += 2
+            context_notes.append("陽の丸坊主：BB最上部 → 買われすぎ・勢いのみ")
+        else:
+            score_bonus += 9
+            context_notes.append("陽の丸坊主：中間帯 → 強い買いシグナル")
+
+    # ════════════════════════════════════════════════════════
+    # ② 下ヒゲ陽線（下ヒゲ≥実体×2、上ヒゲ小）
+    # ════════════════════════════════════════════════════════
+    if is_bull3 and lower3 >= body3 * 2.0 and upper3 <= body3 * 0.8 and range3 > atr * 0.3:
+        patterns.append("下ヒゲ陽線")
+        signals.append("下ヒゲ陽線")
+        if at_low or near_sup:
+            score_bonus += 12
+            context_notes.append("下ヒゲ陽線：安値圏/サポート付近 → 売り圧力を完全吸収・反発確度高")
+        elif at_high or near_res:
+            score_bonus -= 4
+            context_notes.append("下ヒゲ陽線：高値圏/レジスタンス付近 → 上値が重い兆候・買いは慎重に")
+        else:
+            score_bonus += 7
+            context_notes.append("下ヒゲ陽線：中間帯 → 下値を試して切り返し")
+
+    # ════════════════════════════════════════════════════════
+    # ③ ハンマー（陰線だが下ヒゲ≥実体×2.5）
+    # ════════════════════════════════════════════════════════
+    if is_bear3 and lower3 >= body3 * 2.5 and upper3 <= body3 * 0.4 and range3 > atr * 0.3:
+        patterns.append("ハンマー")
+        signals.append("ハンマー")
+        if at_low or near_sup:
+            score_bonus += 10
+            context_notes.append("ハンマー：安値圏 → 下落を吸収・底打ち兆候")
+        elif at_high:
+            score_bonus -= 3
+            context_notes.append("ハンマー：高値圏 → 上値売り圧力の可能性")
+        else:
+            score_bonus += 6
+            context_notes.append("ハンマー：反発の兆候")
+
+    # ════════════════════════════════════════════════════════
+    # ④ 下ヒゲ陰線（陰線で下ヒゲ長い）
+    # ════════════════════════════════════════════════════════
+    if is_bear3 and lower3 >= body3 * 2.0 and upper3 <= body3 * 0.6:
+        if "ハンマー" not in patterns:
+            patterns.append("下ヒゲ陰線")
+            signals.append("下ヒゲ陰線")
+            if at_low or near_sup:
+                score_bonus += 7
+                context_notes.append("下ヒゲ陰線：安値圏 → 下値サポート確認・慎重に買い検討")
+            elif at_high:
+                score_bonus -= 6
+                context_notes.append("下ヒゲ陰線：高値圏 → 上値の重さを示唆・注意")
+            else:
+                score_bonus += 3
+                context_notes.append("下ヒゲ陰線：売り圧力を吸収したが終値は下落")
+
+    # ════════════════════════════════════════════════════════
+    # ⑤ 上ヒゲ陰線（シューティングスター）
+    # ════════════════════════════════════════════════════════
+    if is_bear3 and upper3 >= body3 * 2.0 and lower3 <= body3 * 0.5 and range3 > atr * 0.3:
+        patterns.append("上ヒゲ陰線")
+        signals.append("上ヒゲ陰線")
+        if at_high or near_res:
+            score_bonus -= 13
+            context_notes.append("上ヒゲ陰線：高値圏/レジスタンス付近 → 強い天井シグナル・買い見送り推奨")
+        elif at_low:
+            score_bonus -= 3
+            context_notes.append("上ヒゲ陰線：安値圏 → 反発を試みたが失敗・続落リスク残る")
+        else:
+            score_bonus -= 8
+            context_notes.append("上ヒゲ陰線：上値で売り圧力が強い")
+
+    # ════════════════════════════════════════════════════════
+    # ⑥ 上ヒゲ陽線（高値まで買われたが押し返された）
+    # ════════════════════════════════════════════════════════
+    if is_bull3 and upper3 >= body3 * 2.0 and lower3 <= body3 * 0.5 and range3 > atr * 0.3:
+        if "下ヒゲ陽線" not in patterns:
+            patterns.append("上ヒゲ陽線")
+            signals.append("上ヒゲ陽線")
+            if at_high or near_res:
+                score_bonus -= 8
+                context_notes.append("上ヒゲ陽線：高値圏 → 上値抵抗が強い・天井警戒")
+            elif at_low:
+                score_bonus += 3
+                context_notes.append("上ヒゲ陽線：安値圏 → 戻りを試した段階・様子見")
+            else:
+                score_bonus -= 4
+                context_notes.append("上ヒゲ陽線：上値に売りが出やすい")
+
+    # ════════════════════════════════════════════════════════
+    # ⑦ 包み足（強気）
+    # ════════════════════════════════════════════════════════
+    if is_bear2 and is_bull3 and o3 <= c2 and c3 >= o2 and body3 > body2 * 1.1:
+        patterns.append("包み足(強気)")
+        signals.append("強気包み足")
+        if at_low or (in_downtrend and at_low):
+            score_bonus += 15
+            context_notes.append("強気包み足：安値圏・下落トレンド中 → 最も信頼度が高い反転シグナル")
+        elif at_high:
+            score_bonus += 4
+            context_notes.append("強気包み足：高値圏 → 上昇継続の可能性があるが過熱に注意")
+        elif in_uptrend:
+            score_bonus += 10
+            context_notes.append("強気包み足：上昇トレンド中の押し目 → 再上昇シグナル")
+        else:
+            score_bonus += 12
+            context_notes.append("強気包み足：前日の下落を完全に覆した")
+
+    # ════════════════════════════════════════════════════════
+    # ⑧ 包み足（弱気）
+    # ════════════════════════════════════════════════════════
+    if is_bull2 and is_bear3 and o3 >= c2 and c3 <= o2 and body3 > body2 * 1.1:
+        patterns.append("包み足(弱気)")
+        signals.append("弱気包み足")
+        if at_high or (in_uptrend and at_high):
+            score_bonus -= 15
+            context_notes.append("弱気包み足：高値圏・上昇トレンド後 → 最も信頼度が高い天井シグナル・エントリー禁止")
+        elif at_low:
+            score_bonus -= 5
+            context_notes.append("弱気包み足：安値圏 → 続落リスクあるが下値は限定的")
+        else:
+            score_bonus -= 11
+            context_notes.append("弱気包み足：前日の上昇を完全に覆した・売り圧力強い")
+
+    # ════════════════════════════════════════════════════════
+    # ⑨ 陰の丸坊主
+    # ════════════════════════════════════════════════════════
+    if is_bear3 and body3 >= range3 * 0.85 and range3 > atr * 0.5:
+        patterns.append("陰の丸坊主")
+        signals.append("陰の丸坊主")
+        if at_high:
+            score_bonus -= 14
+            context_notes.append("陰の丸坊主：高値圏 → 強烈な売りシグナル・即エントリー回避")
+        elif at_low and after_decline:
+            score_bonus -= 7
+            context_notes.append("陰の丸坊主：安値圏で続落 → 底打ちまで待ち")
+        else:
+            score_bonus -= 11
+            context_notes.append("陰の丸坊主：強い売り圧力")
+
+    # ════════════════════════════════════════════════════════
+    # ⑩ モーニングスター（3本パターン）
+    # ════════════════════════════════════════════════════════
+    if (is_bear1 and
+        body2 < atr * 0.4 and
+        is_bull3 and
+        c3 > (o1 + c1) / 2 and
+        body3 > atr * 0.5):
+        patterns.append("モーニングスター")
+        signals.append("モーニングスター")
+        if at_low or near_sup:
+            score_bonus += 15
+            context_notes.append("モーニングスター：安値圏 → 教科書的な底打ち反転・高信頼度")
+        elif at_high:
+            score_bonus += 5
+            context_notes.append("モーニングスター：高値圏 → 一時的な反発の可能性")
+        else:
+            score_bonus += 12
+            context_notes.append("モーニングスター：3本で底打ちを確認")
+
+    # ════════════════════════════════════════════════════════
+    # ⑪ 十字線（実体ほぼゼロ）
+    # ════════════════════════════════════════════════════════
+    if body3 < range3 * 0.1 and range3 > atr * 0.3:
+        patterns.append("十字線")
+        signals.append("十字線")
+        if at_low and is_bear2:
+            score_bonus += 8
+            context_notes.append("十字線：安値圏・下落後 → 売り勢力が尽きた可能性・反発待ち")
+        elif at_high and is_bull2:
+            score_bonus -= 8
+            context_notes.append("十字線：高値圏・上昇後 → 買い勢力が止まった・天井警戒")
+        else:
+            score_bonus += 2
+            context_notes.append("十字線：方向感に迷い・次の足で判断")
+
+    # ════════════════════════════════════════════════════════
+    # ⑫ イブニングスター（3本・天井パターン）
+    # ════════════════════════════════════════════════════════
+    if (is_bull1 and
+        body2 < atr * 0.4 and
+        is_bear3 and
+        c3 < (o1 + c1) / 2 and
+        body3 > atr * 0.5):
+        patterns.append("イブニングスター")
+        signals.append("イブニングスター")
+        if at_high:
+            score_bonus -= 15
+            context_notes.append("イブニングスター：高値圏 → 強力な天井シグナル・エントリー厳禁")
+        else:
+            score_bonus -= 9
+            context_notes.append("イブニングスター：上昇の勢いが止まった")
+
+    # クランプ（±15点）
+    score_bonus = max(-15, min(15, score_bonus))
+    bullish = score_bonus > 0
+
+    result.update({
+        "patterns":      patterns,
+        "score_bonus":   score_bonus,
+        "signals":       signals,
+        "bullish":       bullish,
+        "context_notes": context_notes,
+    })
+    return result
+
 
 # ─── ランキング計算 ───────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -1364,9 +1677,34 @@ def main():
         page = st.radio("", ["🏆 銘柄ランキング", "📂 保有株管理"], label_visibility="collapsed")
 
         st.markdown("---")
-        st.markdown("### ⚙️ スコアフィルター")
+        st.markdown("### ⚙️ フィルター設定")
+
+        st.markdown("**スコア・RR**")
         min_score = st.slider("最低スコア", 0, 100, 50)
-        min_rr = st.slider("最低リスクリワード比", 0.5, 5.0, 1.5, step=0.1)
+        min_rr    = st.slider("最低リスクリワード比", 0.5, 5.0, 1.5, step=0.1)
+
+        st.markdown("**流動性フィルター**")
+        min_vol_ratio  = st.slider("最低出来高比（平均比）", 0.0, 3.0, 0.5, step=0.1,
+                                    help="平均出来高に対する直近出来高の比率。0.5＝平均の50%以上")
+        min_daily_val  = st.selectbox("最低売買代金",
+                                       ["制限なし", "1億円以上", "5億円以上", "10億円以上", "50億円以上"],
+                                       index=1,
+                                       help="流動性が低い銘柄はスプレッドが広く損切りが機能しない")
+        daily_val_map  = {"制限なし": 0, "1億円以上": 1e8, "5億円以上": 5e8,
+                          "10億円以上": 1e9, "50億円以上": 5e9}
+        min_daily_val_v = daily_val_map[min_daily_val]
+
+        st.markdown("**価格帯フィルター**")
+        min_price = st.number_input("最低株価（円）", value=500, step=100, min_value=0,
+                                     help="低価格帯は値幅制限に引っかかりやすい")
+        max_price = st.number_input("最高株価（円）", value=0, step=1000, min_value=0,
+                                     help="0＝制限なし")
+
+        st.markdown("**その他フィルター**")
+        exclude_earnings_danger = st.checkbox("決算7日前銘柄を除外", value=True,
+                                               help="決算直前はギャップリスクが大きい")
+        require_bullish_candle  = st.checkbox("強気ローソク足パターンのみ",  value=False,
+                                               help="陽の丸坊主・包み足・ハンマー等が出ている銘柄のみ表示")
 
         st.markdown("---")
         st.markdown("### 🕐 取引時間帯")
@@ -1417,8 +1755,24 @@ def main():
         # 市場環境バナー
         show_market_environment(market_env)
 
-        # フィルタリング
-        filtered = [r for r in rankings if r['score'] >= min_score and r['rr_ratio'] >= min_rr]
+        # ─── フィルタリング ─────────────────────────────────
+        def passes_filter(r):
+            # スコア・RR
+            if r['score'] < min_score:               return False
+            if r['rr_ratio'] < min_rr:               return False
+            # 流動性
+            if r['vol_ratio'] < min_vol_ratio:        return False
+            if r.get('daily_value', 0) < min_daily_val_v: return False
+            # 価格帯
+            if r['current_price'] < min_price:        return False
+            if max_price > 0 and r['current_price'] > max_price: return False
+            # 決算除外
+            if exclude_earnings_danger and r.get('earnings_warning') == 'danger': return False
+            # 強気ローソク足
+            if require_bullish_candle and r.get('candle_bonus', 0) <= 0: return False
+            return True
+
+        filtered = [r for r in rankings if passes_filter(r)]
 
         if not filtered:
             st.warning("現在の条件に合う銘柄がありません。フィルターを緩めてください。")
@@ -1455,25 +1809,57 @@ def main():
             dte = stock.get("days_to_earnings")
             dtd = stock.get("days_to_ex_div")
             madj = stock.get("market_score_adj", 0)
+            cbonus    = stock.get("candle_bonus", 0)
+            cpatterns = stock.get("candle_patterns", [])
+            cnotes    = stock.get("candle_notes", [])
 
             if ew == "danger":
-                earnings_badge_html = f'<span style="background:#4a0d0d;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">🚨 決算{dte}日前・エントリー危険</span>'
+                earnings_badge_html = '<span style="background:#4a0d0d;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#128680; 決算' + str(dte) + '日前・エントリー危険</span>'
             elif ew == "caution":
-                earnings_badge_html = f'<span style="background:#3a2500;color:#ffa657;border:1px solid #f0883e;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">⚠️ 決算{dte}日前・要注意</span>'
+                earnings_badge_html = '<span style="background:#3a2500;color:#ffa657;border:1px solid #f0883e;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9888; 決算' + str(dte) + '日前・要注意</span>'
             else:
                 earnings_badge_html = ""
 
             if dw == "caution":
-                div_badge_html = f'<span style="background:#1a2a3a;color:#79c0ff;border:1px solid #388bfd;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">💴 配当落ち{dtd}日前</span>'
+                div_badge_html = '<span style="background:#1a2a3a;color:#79c0ff;border:1px solid #388bfd;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#128180; 配当落ち' + str(dtd) + '日前</span>'
             else:
                 div_badge_html = ""
 
             if madj > 0:
-                market_adj_html = f'<span style="background:#0d2a1a;color:#3fb950;border:1px solid #238636;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">📈 地合いボーナス +{madj}pt</span>'
+                market_adj_html = '<span style="background:#0d2a1a;color:#3fb950;border:1px solid #238636;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#8593; 地合いボーナス +' + str(madj) + 'pt</span>'
             elif madj < 0:
-                market_adj_html = f'<span style="background:#2a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">📉 地合いペナルティ {madj}pt</span>'
+                market_adj_html = '<span style="background:#2a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#8595; 地合いペナルティ ' + str(madj) + 'pt</span>'
             else:
                 market_adj_html = ""
+
+            # ローソク足パターンバッジ＋文脈メモ
+            if cpatterns and cbonus > 0:
+                candle_badge_html = '<span style="background:#1a3a2a;color:#3fb950;border:1px solid #2ea043;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9679; ' + " / ".join(cpatterns[:2]) + ' +' + str(cbonus) + 'pt</span>'
+            elif cpatterns and cbonus < 0:
+                candle_badge_html = '<span style="background:#3a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9679; ' + " / ".join(cpatterns[:2]) + ' ' + str(cbonus) + 'pt</span>'
+            else:
+                candle_badge_html = ""
+
+            if cnotes:
+                note_color       = "#3fb950" if cbonus > 0 else "#f85149"
+                candle_note_html = (
+                    '<div style="background:#0d1117;border-radius:6px;padding:8px 10px;'
+                    'margin-top:4px;font-size:0.75rem;border-left:3px solid ' + note_color + ';">'
+                    '<span style="color:#8b949e;">&#128337; ローソク足文脈：</span>'
+                    '<span style="color:' + note_color + ';">' + cnotes[0] + '</span>'
+                    '</div>'
+                )
+            else:
+                candle_note_html = ""
+
+            # 売買代金
+            daily_val = stock.get("daily_value", 0)
+            if daily_val >= 1e10:
+                daily_val_str = f"{daily_val/1e10:.1f}兆円"
+            elif daily_val >= 1e8:
+                daily_val_str = f"{daily_val/1e8:.0f}億円"
+            else:
+                daily_val_str = f"{daily_val/1e6:.0f}百万円"
 
 
             pct_color  = "#3fb950" if stock['pct_1d'] >= 0 else "#f85149"
@@ -1527,21 +1913,23 @@ def main():
                 + '</div>'
                 + '<div style="margin:8px 0;">' + strategy_badge + '&nbsp;&nbsp;' + signals_html + '</div>'
                 + '<div style="margin:4px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'
-                +   earnings_badge_html + div_badge_html + market_adj_html
+                +   earnings_badge_html + div_badge_html + market_adj_html + candle_badge_html
                 + '</div>'
                 + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:8px;font-size:0.78rem;color:#8b949e;">'
                 +   '<strong style="color:#f0f6fc;">&#127919; エントリー根拠：</strong>'
                 +   '<span style="color:' + sc + ';">' + strategy_desc + '</span>'
                 + '</div>'
+                + candle_note_html
                 + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:6px;font-size:0.78rem;color:#8b949e;">'
                 +   '<strong style="color:#f0f6fc;">&#128202; スコア解説：</strong>' + reasons_str
                 + '</div>'
-                + '<div style="margin-top:8px;font-size:0.75rem;display:flex;gap:16px;">'
+                + '<div style="margin-top:8px;font-size:0.75rem;display:flex;gap:16px;flex-wrap:wrap;">'
                 +   '<span>1日: <b style="color:' + pct_color + ';">' + pct1d_str + '</b></span>'
                 +   '<span>5日: <b style="color:' + pct5_color + ';">' + pct5d_str + '</b></span>'
                 +   '<span>RSI: <b style="color:#d2a8ff;">' + rsi_str + '</b></span>'
                 +   '<span>BB位置: <b style="color:#79c0ff;">' + bb_pct_str + '</b></span>'
                 +   '<span>出来高比: <b style="color:#ffa657;">' + vol_str + '</b></span>'
+                +   '<span style="color:#8b949e;">売買代金: <b style="color:#c9d1d9;">' + daily_val_str + '</b></span>'
                 + '</div>'
                 + '</div>'
             )
