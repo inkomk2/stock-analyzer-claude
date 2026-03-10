@@ -274,7 +274,7 @@ def calc_market_environment():
         score_multiplier,   # 個別スコアへの乗数 0.6〜1.15
         score_adj,          # 個別スコアへの加減点 -20〜+10
         nk_price, nk_1d, nk_5d, nk_20d,
-        nk_ma5, nk_ma20, nk_rsi,
+        nk_ma5, nk_ma25, nk_rsi,
         topix_1d, topix_5d,
         vix, vix_level,
         warnings, positives
@@ -284,7 +284,7 @@ def calc_market_environment():
         "phase": "neutral", "phase_label": "中立", "phase_color": "#8b949e",
         "score_multiplier": 1.0, "score_adj": 0,
         "nk_price": None, "nk_1d": 0.0, "nk_5d": 0.0, "nk_20d": 0.0,
-        "nk_ma5": None, "nk_ma20": None, "nk_rsi": 50.0,
+        "nk_ma5": None, "nk_ma25": None, "nk_rsi": 50.0,
         "topix_1d": 0.0, "topix_5d": 0.0,
         "vix": None, "vix_level": "normal",
         "warnings": [], "positives": []
@@ -300,7 +300,7 @@ def calc_market_environment():
             result["nk_5d"]  = (nk_close.iloc[-1] / nk_close.iloc[-5]  - 1) * 100 if len(nk_close) >= 5  else 0
             result["nk_20d"] = (nk_close.iloc[-1] / nk_close.iloc[-20] - 1) * 100 if len(nk_close) >= 20 else 0
             result["nk_ma5"]  = nk_close.rolling(5).mean().iloc[-1]
-            result["nk_ma20"] = nk_close.rolling(20).mean().iloc[-1]
+            result["nk_ma25"] = nk_close.rolling(25).mean().iloc[-1]
             result["nk_rsi"]  = calc_rsi(nk_close).iloc[-1]
 
         # TOPIX (ETF: 1306.T)
@@ -331,7 +331,7 @@ def calc_market_environment():
     # ── フェーズ判定ロジック ──
     nk_price = result["nk_price"]
     nk_ma5   = result["nk_ma5"]
-    nk_ma20  = result["nk_ma20"]
+    nk_ma25  = result["nk_ma25"]
     nk_rsi   = result["nk_rsi"]
     nk_1d    = result["nk_1d"]
     nk_5d    = result["nk_5d"]
@@ -342,21 +342,21 @@ def calc_market_environment():
     positives = []
     adj       = 0  # スコア加減点
 
-    if nk_price and nk_ma5 and nk_ma20:
+    if nk_price and nk_ma5 and nk_ma25:
         # 強気シグナル
-        if nk_price > nk_ma5 > nk_ma20:
-            positives.append("日経がMA5>MA20の上昇配列")
+        if nk_price > nk_ma5 > nk_ma25:
+            positives.append("日経がMA5>MA25の上昇配列")
             adj += 5
-        elif nk_price > nk_ma20:
-            positives.append("日経がMA20上で推移")
+        elif nk_price > nk_ma25:
+            positives.append("日経がMA25上で推移")
             adj += 2
 
         # 弱気シグナル
-        if nk_price < nk_ma20:
-            warnings.append("日経がMA20を下回っている（下降トレンド）")
+        if nk_price < nk_ma25:
+            warnings.append("日経がMA25を下回っている（下降トレンド）")
             adj -= 10
-        if nk_price < nk_ma5 and nk_ma5 < nk_ma20:
-            warnings.append("日経がデッドクロス配列（MA5<MA20）")
+        if nk_price < nk_ma5 and nk_ma5 < nk_ma25:
+            warnings.append("日経がデッドクロス配列（MA5<MA25）")
             adj -= 8
 
         # RSI
@@ -510,8 +510,8 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
 
     # ─── 移動平均 ───
     ma5 = close.rolling(5).mean().iloc[-1]
-    ma20 = close.rolling(20).mean().iloc[-1]
-    ma60 = close.rolling(min(60, len(close))).mean().iloc[-1]
+    ma25 = close.rolling(25).mean().iloc[-1]
+    ma75 = close.rolling(min(75, len(close))).mean().iloc[-1]
 
     # ─── RSI ───
     rsi = calc_rsi(close)
@@ -597,20 +597,20 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
 
     # 移動平均スコア（20点）
     ma_score = 0
-    if current_price > ma5 > ma20 > ma60:  # パーフェクトオーダー
+    if current_price > ma5 > ma25 > ma75:  # パーフェクトオーダー
         ma_score = 20
         signals.append("MA完全陽転")
-        reasons.append("MA5>MA20>MA60のパーフェクトオーダー（強いトレンド）")
-    elif current_price > ma20 and ma5 > ma20:
+        reasons.append("MA5>MA25>MA75のパーフェクトオーダー（強いトレンド）")
+    elif current_price > ma25 and ma5 > ma25:
         ma_score = 14
         signals.append("MA上昇配列")
-        reasons.append("MA5・MA20上向きでトレンド良好")
-    elif current_price > ma20:
+        reasons.append("MA5・MA25上向きでトレンド良好")
+    elif current_price > ma25:
         ma_score = 10
-        reasons.append("MA20上で推移（上昇バイアス）")
-    elif current_price < ma20 and current_price > ma60:
+        reasons.append("MA25上で推移（上昇バイアス）")
+    elif current_price < ma25 and current_price > ma75:
         ma_score = 6
-        reasons.append("MA20下でMA60上（調整局面）")
+        reasons.append("MA25下でMA75上（調整局面）")
     else:
         ma_score = 2
         reasons.append("移動平均線下（下降トレンド）")
@@ -726,12 +726,12 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
 
     # ─── エントリー戦略の自動選択 ────────────────────────────
     # 戦略A: 押し目買い（トレンドフォロー）
-    #   条件: MAパーフェクトオーダー or MA5>MA20、かつ現値がMA5またはMA20の±1ATR圧内
+    #   条件: MAパーフェクトオーダー or MA5>MA25、かつ現値がMA5またはMA25の±1ATR圧内
     dist_to_ma5  = abs(current_price - ma5)
-    dist_to_ma20 = abs(current_price - ma20)
+    dist_to_ma20 = abs(current_price - ma25)
     near_ma5  = dist_to_ma5  < atr * 0.5
     near_ma20 = dist_to_ma20 < atr * 0.8
-    trend_up = (ma5 > ma20) and (current_price > ma20)
+    trend_up = (ma5 > ma25) and (current_price > ma25)
 
     # 戦略B: BB下限反発（逆張り）
     #   条件: BB位置が20%以下、RSIが50以下で上向き
@@ -742,23 +742,23 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     near_support = abs(current_price - nearest_support) < atr * 0.4
 
     # 戦略D: ブレイクアウト
-    #   条件: 出来高急増(1.8倍以上) + MACDヒストグラム拡大 + 現値がMA20を明確に上抜け
+    #   条件: 出来高急増(1.8倍以上) + MACDヒストグラム拡大 + 現値がMA25を明確に上抜け
     breakout = (
         vol_ratio >= 1.8 and
         macd_hist_now > macd_hist_prev and
         macd_hist_now > 0 and
-        current_price > ma20 * 1.005
+        current_price > ma25 * 1.005
     )
 
-    # 戦略の優先順位: D > A(MA5) > A(MA20) > B > C > デフォルト
+    # 戦略の優先順位: D > A(MA5) > A(MA25) > B > C > デフォルト
     if breakout:
         strategy_type = "D"
         strategy_label = "ブレイクアウト買い"
-        strategy_desc  = f"出来高{vol_ratio:.1f}倍・MACD拡大・MA20上抜け → 勢い乗り"
+        strategy_desc  = f"出来高{vol_ratio:.1f}倍・MACD拡大・MA25上抜け → 勢い乗り"
         # ブレイク直後は現値より少し上で確認買い
         entry_price  = round(current_price * 1.002, 0)
-        # 損切: MA20を割り込んだら即撤退
-        stop_loss    = round(max(ma20 * 0.997, entry_price - atr * 1.0), 0)
+        # 損切: MA25を割り込んだら即撤退
+        stop_loss    = round(max(ma25 * 0.997, entry_price - atr * 1.0), 0)
         # 利確: 直近レジスタンスかATR×3.0
         take_profit  = round(min(nearest_resistance * 0.998,
                                   entry_price + atr * 3.0), 0)
@@ -775,10 +775,10 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
 
     elif trend_up and near_ma20:
         strategy_type = "A2"
-        strategy_label = "押し目買い（MA20タッチ）"
-        strategy_desc  = f"上昇トレンド中のMA20({ma20:,.0f})押し目 → 中期線反発"
-        entry_price  = round(ma20 * 1.001, 0)
-        stop_loss    = round(ma20 - atr * 1.0, 0)
+        strategy_label = "押し目買い（MA25タッチ）"
+        strategy_desc  = f"上昇トレンド中のMA25({ma25:,.0f})押し目 → 中期線反発"
+        entry_price  = round(ma25 * 1.001, 0)
+        stop_loss    = round(ma25 - atr * 1.0, 0)
         take_profit  = round(min(nearest_resistance * 0.998,
                                   entry_price + atr * 3.0), 0)
 
@@ -789,7 +789,7 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         # BB下限より少し上で指値
         entry_price  = round(bb_lower_now * 1.002, 0)
         stop_loss    = round(bb_lower_now - atr * 0.5, 0)
-        # 利確: BB中央線（MA20）を第1目標、BB上限を第2目標
+        # 利確: BB中央線（MA25）を第1目標、BB上限を第2目標
         take_profit  = round(bb_mid.iloc[-1], 0)
 
     elif near_support:
@@ -859,8 +859,8 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         "pct_5d": pct_5d,
         "pct_20d": pct_20d,
         "ma5": ma5,
-        "ma20": ma20,
-        "ma60": ma60,
+        "ma25": ma25,
+        "ma75": ma75,
         "nearest_support": nearest_support,
         "nearest_resistance": nearest_resistance,
         "df": df
@@ -1025,8 +1025,8 @@ def draw_chart(stock_data):
 
     # 移動平均
     fig.add_trace(go.Scatter(x=df.index, y=close.rolling(5).mean(), line=dict(color='#ffa657', width=1), name="MA5"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=close.rolling(20).mean(), line=dict(color='#79c0ff', width=1.5), name="MA20"), row=1, col=1)
-    fig.add_trace(go.Scatter(x=df.index, y=close.rolling(60).mean(), line=dict(color='#d2a8ff', width=1), name="MA60"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=close.rolling(25).mean(), line=dict(color='#79c0ff', width=1.5), name="MA25"), row=1, col=1)
+    fig.add_trace(go.Scatter(x=df.index, y=close.rolling(75).mean(), line=dict(color='#d2a8ff', width=1), name="MA75"), row=1, col=1)
 
     # エントリー・利確・損切りライン
     fig.add_hline(y=stock_data['entry_price'], line_color='#79c0ff', line_dash='dash', annotation_text="エントリー", row=1, col=1)
