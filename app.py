@@ -1966,6 +1966,12 @@ def _render_ranking(rankings, market_env, mode,
 
         card_border = "border-left:4px solid #f85149;" if is_short and rank <= 3 else ""
 
+        # 三項演算子をstring連結内に書くとPythonの優先順位で壊れるため事前変数化
+        if is_short:
+            entry_cell_html = '<div><div class="order-label">売りエントリー</div><div style="color:#f85149;font-weight:600;">' + entry_str + '</div></div>'
+        else:
+            entry_cell_html = '<div><div class="order-label">エントリー</div><div class="order-entry">' + entry_str + '</div></div>'
+
         card_html = (
             '<div class="rank-card ' + card_class + '" style="' + card_border + '">'
             + '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
@@ -1985,8 +1991,7 @@ def _render_ranking(rankings, market_env, mode,
             + '</div>'
             + '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:10px 0;font-family:JetBrains Mono,monospace;font-size:0.82rem;">'
             +   '<div><div class="order-label">現在値</div><div style="color:#f0f6fc;font-weight:600;">' + cur_price_str + '</div></div>'
-            +   '<div><div class="order-label">売りエントリー</div><div style="color:#f85149;font-weight:600;">' + entry_str + '</div></div>' if is_short else
-                '<div><div class="order-label">エントリー</div><div class="order-entry">' + entry_str + '</div></div>'
+            +   entry_cell_html
             +   '<div><div class="order-label">利確目標</div><div class="order-profit">' + tp_str + '</div></div>'
             +   '<div><div class="order-label">損切ライン</div><div class="order-loss">' + sl_str + '</div></div>'
             +   '<div><div class="order-label">RR比</div><div style="color:#ffa657;font-weight:600;">' + rr_str + '</div></div>'
