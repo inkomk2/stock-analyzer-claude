@@ -98,7 +98,8 @@ html, body, [class*="css"] {
     margin: 2px;
 }
 
-.tag-buy { background: #1a4a1a; color: #3fb950; border: 1px solid #238636; }
+.tag-buy  { background: #1a4a1a; color: #3fb950; border: 1px solid #238636; }
+.tag-sell { background: #3a0d0d; color: #f85149; border: 1px solid #b91c1c; }
 .tag-rsi { background: #1a3a5c; color: #79c0ff; border: 1px solid #388bfd; }
 .tag-macd { background: #3a1a5c; color: #d2a8ff; border: 1px solid #8957e5; }
 .tag-vol { background: #3a2a1a; color: #ffa657; border: 1px solid #f0883e; }
@@ -499,7 +500,7 @@ def get_earnings_info(ticker_code):
         pass
     return info
 
-def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
+def analyze_stock(ticker_code, name, market_env=None, earnings_info=None, mode="long"):
     df = fetch_stock_data(ticker_code)
     if df is None or len(df) < 26:
         return None
@@ -742,7 +743,20 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     # スコアを0〜100にクランプ
     score = max(0.0, min(100.0, score))
 
-    recent_5d_low = df['Low'].tail(5).min()
+    recent_5d_low  = df['Low'].tail(5).min()
+    recent_5d_high = df['High'].tail(5).max()
+
+    # ─── 売りモード時：スコアを反転して「売り優先度」に変換 ──
+    if mode == "short":
+        # 買いスコアが低い ＝ 売りに向いている（100から引く）
+        # ただし弱気パターンは追加ボーナスとして残す
+        base_short_score = 100 - score
+        # 地合いが悪いほど売りスコアUP（市場環境ペナルティを逆用）
+        if market_env:
+            raw_adj = market_env.get("score_adj", 0)
+            if raw_adj < 0:
+                base_short_score += min(15, abs(raw_adj))
+        score = max(0.0, min(100.0, base_short_score))
 
     # ─── エントリー戦略の自動選択 ────────────────────────────
     # 戦略A: 押し目買い（トレンドフォロー）
@@ -751,7 +765,8 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
     dist_to_ma20 = abs(current_price - ma25)
     near_ma5  = dist_to_ma5  < atr * 0.5
     near_ma20 = dist_to_ma20 < atr * 0.8
-    trend_up = (ma5 > ma25) and (current_price > ma25)
+    trend_up   = (ma5 > ma25) and (current_price > ma25)
+    trend_down = (ma5 < ma25) and (current_price < ma25)
 
     # 戦略B: BB下限反発（逆張り）
     #   条件: BB位置が20%以下、RSIが50以下で上向き
@@ -830,6 +845,120 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         stop_loss    = round(entry_price - atr * 1.0, 0)
         take_profit  = round(entry_price + atr * 2.5, 0)
 
+    # ─── 売りモード：買い戦略を売り戦略に上書き ──────────────
+    if mode == "short":
+        bb_upper_now_val = bb_upper.iloc[-1]
+        near_resistance  = abs(current_price - nearest_resistance) < atr * 0.5
+        breakdown = (
+            vol_ratio >= 1.8 and
+            macd_hist_now < macd_hist_prev and
+            macd_hist_now < 0 and
+            current_price < ma25 * 0.995
+        )
+        short_b = (bb_pct > 0.75) and (rsi_now > 50) and (rsi_now > rsi_prev)  # BB上限売り
+        near_ma5_short  = dist_to_ma5  < atr * 0.5
+        near_ma25_short = dist_to_ma20 < atr * 0.8
+
+        if breakdown:
+            strategy_type  = "SD"
+            strategy_label = "ブレイクダウン売り"
+            strategy_desc  = f"出来高{vol_ratio:.1f}倍・MACD下落・MA25下抜け → 下落加速"
+            entry_price  = round(current_price * 0.998, 0)
+            stop_loss    = round(min(ma25 * 1.003, entry_price + atr * 1.0), 0)
+            take_profit  = round(max(nearest_support * 1.002,
+                                     entry_price - atr * 3.0), 0)
+        elif trend_down and near_ma5_short:
+            strategy_type  = "SA1"
+            strategy_label = "戻り売り（MA5タッチ）"
+            strategy_desc  = f"下降トレンド中のMA5({ma5:,.0f})戻り → 反落狙い"
+            entry_price  = round(ma5 * 0.999, 0)
+            stop_loss    = round(ma5 + atr * 0.8, 0)
+            take_profit  = round(max(nearest_support * 1.002,
+                                     entry_price - atr * 2.5), 0)
+        elif trend_down and near_ma25_short:
+            strategy_type  = "SA2"
+            strategy_label = "戻り売り（MA25タッチ）"
+            strategy_desc  = f"下降トレンド中のMA25({ma25:,.0f})戻り → 中期線から反落"
+            entry_price  = round(ma25 * 0.999, 0)
+            stop_loss    = round(ma25 + atr * 1.0, 0)
+            take_profit  = round(max(nearest_support * 1.002,
+                                     entry_price - atr * 3.0), 0)
+        elif short_b:
+            strategy_type  = "SB"
+            strategy_label = "BB上限反落（逆張り売り）"
+            strategy_desc  = f"BBバンド上限({bb_upper_now_val:,.0f})付近・RSI{rsi_now:.0f}で天井形成"
+            entry_price  = round(bb_upper_now_val * 0.998, 0)
+            stop_loss    = round(bb_upper_now_val + atr * 0.5, 0)
+            take_profit  = round(bb_mid.iloc[-1], 0)
+        elif near_resistance:
+            strategy_type  = "SC"
+            strategy_label = "レジスタンス反落"
+            strategy_desc  = f"直近レジスタンス({nearest_resistance:,.0f})タッチ → 天井水平線反落"
+            entry_price  = round(nearest_resistance * 0.997, 0)
+            stop_loss    = round(nearest_resistance * 1.010, 0)
+            take_profit  = round(max(nearest_support * 1.002,
+                                     entry_price - atr * 2.5), 0)
+        else:
+            strategy_type  = "SATR"
+            strategy_label = "ATRベース売り"
+            strategy_desc  = "特定パターン未検出。ATR基準の標準売りエントリー"
+            entry_price  = round(current_price * 1.003, 0)
+            stop_loss    = round(entry_price + atr * 1.0, 0)
+            take_profit  = round(entry_price - atr * 2.5, 0)
+
+        # 売りの価格整合性チェック
+        if entry_price < current_price * 0.97:
+            entry_price = round(current_price * 0.998, 0)
+        if entry_price > current_price * 1.03:
+            entry_price = round(current_price * 1.003, 0)
+        if stop_loss <= entry_price:
+            stop_loss = round(entry_price + atr * 1.0, 0)
+        if take_profit >= entry_price:
+            take_profit = round(entry_price - atr * 2.5, 0)
+
+        # 売りのRR: 利益＝entry-take_profit、損失＝stop_loss-entry
+        profit_pct = (entry_price / take_profit - 1) * 100 if take_profit > 0 else 0
+        loss_pct   = (stop_loss  / entry_price - 1) * 100
+        rr_ratio   = profit_pct / abs(loss_pct) if loss_pct != 0 else 0
+
+        daily_value = float(volume.iloc[-1]) * float(close.iloc[-1])
+
+        return {
+            "code": ticker_code, "name": name,
+            "current_price": current_price,
+            "entry_price": entry_price,
+            "take_profit": take_profit,
+            "stop_loss": stop_loss,
+            "profit_pct": profit_pct,
+            "loss_pct": loss_pct,
+            "rr_ratio": rr_ratio,
+            "score": round(score, 1),
+            "signals": signals,
+            "reasons": reasons,
+            "market_reasons": market_reasons,
+            "market_score_adj": market_score_adj,
+            "earnings_warning": earnings_warning,
+            "div_warning": div_warning,
+            "days_to_earnings": days_to_earnings,
+            "days_to_ex_div": days_to_ex_div,
+            "candle_patterns": candle_patterns,
+            "candle_bonus": candle_bonus,
+            "candle_notes": candle_notes,
+            "strategy_type": strategy_type,
+            "strategy_label": strategy_label,
+            "strategy_desc": strategy_desc,
+            "rsi": rsi_now, "rsi_prev": rsi_prev,
+            "macd_hist": macd_hist_now,
+            "bb_pct": bb_pct, "bb_lower": bb_lower_now,
+            "vol_ratio": vol_ratio, "daily_value": daily_value,
+            "pct_1d": pct_1d, "pct_5d": pct_5d, "pct_20d": pct_20d,
+            "ma5": ma5, "ma25": ma25, "ma75": ma75,
+            "nearest_support": nearest_support,
+            "nearest_resistance": nearest_resistance,
+            "mode": "short", "df": df
+        }
+
+    # ─── 買いモード：価格整合性チェック ─────────────────────
     # エントリー価格が現在値より大幅に乖離していたら補正
     if entry_price > current_price * 1.03:
         entry_price = round(current_price * 1.002, 0)
@@ -890,6 +1019,7 @@ def analyze_stock(ticker_code, name, market_env=None, earnings_info=None):
         "ma75": ma75,
         "nearest_support": nearest_support,
         "nearest_resistance": nearest_resistance,
+        "mode": "long",
         "df": df
     }
 
@@ -1192,8 +1322,9 @@ def detect_candlestick_patterns(df, bb_pct=0.5, ma5=None, ma25=None, ma75=None,
 # ─── ランキング計算 ───────────────────────────────────────────
 @st.cache_data(ttl=86400, show_spinner=False)
 def compute_rankings(_progress_callback=None):
-    results  = []
-    tickers  = list(NIKKEI225_TICKERS.items())
+    results_long  = []
+    results_short = []
+    tickers       = list(NIKKEI225_TICKERS.items())
 
     # 市場環境を先に1回だけ取得
     progress_bar = st.progress(0, text="市場環境を分析中...")
@@ -1204,17 +1335,26 @@ def compute_rankings(_progress_callback=None):
             (i + 1) / len(tickers),
             text=f"分析中: {name} ({code})"
         )
-        # 決算・配当情報取得
         earnings_info = get_earnings_info(code)
-        result = analyze_stock(code, name,
+
+        r_long = analyze_stock(code, name,
                                market_env=market_env,
-                               earnings_info=earnings_info)
-        if result:
-            results.append(result)
+                               earnings_info=earnings_info,
+                               mode="long")
+        if r_long:
+            results_long.append(r_long)
+
+        r_short = analyze_stock(code, name,
+                                market_env=market_env,
+                                earnings_info=earnings_info,
+                                mode="short")
+        if r_short:
+            results_short.append(r_short)
 
     progress_bar.empty()
-    results.sort(key=lambda x: x['score'], reverse=True)
-    return results[:20], market_env
+    results_long.sort(key=lambda x: x['score'],  reverse=True)
+    results_short.sort(key=lambda x: x['score'], reverse=True)
+    return results_long[:20], results_short[:20], market_env
 
 def show_market_environment(env):
     """ランキングページ上部に市場環境バナーを表示"""
@@ -1645,6 +1785,280 @@ def portfolio_section(portfolio):
                     st.success(f"✅ {pos['name']} をクローズ。実現損益: {'+' if realized_pl >= 0 else ''}¥{realized_pl:,.0f}")
                     st.rerun()
 
+# ─── ランキング表示共通関数 ───────────────────────────────────
+def _render_ranking(rankings, market_env, mode,
+                    min_score, min_rr, min_vol_ratio, min_daily_val_v,
+                    min_price, max_price,
+                    exclude_earnings_danger, require_bullish_candle,
+                    portfolio):
+
+    is_short = (mode == "short")
+
+    # ── フィルタリング ──────────────────────────────────────
+    def passes_filter(r):
+        if r['score'] < min_score:                          return False
+        if r['rr_ratio'] < min_rr:                          return False
+        if r['vol_ratio'] < min_vol_ratio:                  return False
+        if r.get('daily_value', 0) < min_daily_val_v:       return False
+        if r['current_price'] < min_price:                  return False
+        if max_price > 0 and r['current_price'] > max_price: return False
+        if exclude_earnings_danger and r.get('earnings_warning') == 'danger': return False
+        if require_bullish_candle and r.get('candle_bonus', 0) <= 0: return False
+        return True
+
+    filtered = [r for r in rankings if passes_filter(r)]
+
+    if not filtered:
+        st.warning("現在の条件に合う銘柄がありません。フィルターを緩めてください。")
+        return
+
+    if is_short:
+        phase = market_env.get("phase", "neutral")
+        if phase in ("bull", "mild_bull"):
+            st.warning("⚠️ 現在の地合いは強気です。売りエントリーは地合いが弱気・中立の時に有効です。リスク管理を徹底してください。")
+        st.caption("📉 信用売りランキング。下落が見込まれる銘柄を表示。損切りは現値より上に設定されます。")
+    else:
+        st.caption("📈 買いランキング。テクニカル的に上昇が見込まれる銘柄を表示。")
+
+    # ── カードレンダリング ────────────────────────────────
+    # 売り用戦略バッジ色テーブル
+    short_strat_colors = {
+        "SD":   ("#f85149", "#3a0d0d", "&#128308;"),
+        "SA1":  ("#ffa657", "#3a2500", "&#128308;"),
+        "SA2":  ("#ffa657", "#3a2500", "&#128308;"),
+        "SB":   ("#d2a8ff", "#2a1a45", "&#8595;"),
+        "SC":   ("#f0883e", "#3a1a00", "&#127973;"),
+        "SATR": ("#8b949e", "#21262d", "&#128202;"),
+    }
+    long_strat_colors = {
+        "D":   ("#ff9500", "#3a2500", "&#128640;"),
+        "A1":  ("#79c0ff", "#0d2a45", "&#128208;"),
+        "A2":  ("#79c0ff", "#0d2a45", "&#128208;"),
+        "B":   ("#d2a8ff", "#2a1a45", "&#8617;"),
+        "C":   ("#3fb950", "#0d2a1a", "&#127959;"),
+        "ATR": ("#8b949e", "#21262d", "&#128202;"),
+    }
+
+    for i, stock in enumerate(filtered):
+        rank       = i + 1
+        card_class = "gold" if rank == 1 else ("silver" if rank == 2 else ("bronze" if rank == 3 else "normal"))
+        rank_icon  = "&#129351;" if rank == 1 else ("&#129352;" if rank == 2 else ("&#129353;" if rank == 3 else "#" + str(rank)))
+
+        score_pct    = stock['score']
+        tag_class    = "tag-sell" if is_short else "tag-buy"
+        signals_html = "".join([
+            '<span class="signal-tag ' + tag_class + '">' + s + '</span>'
+            for s in stock['signals'][:3]
+        ])
+
+        stype        = stock.get('strategy_type', 'ATR')
+        color_table  = short_strat_colors if is_short else long_strat_colors
+        default_key  = "SATR" if is_short else "ATR"
+        sc, sbg, sicon = color_table.get(stype, color_table[default_key])
+        strategy_badge = (
+            '<span style="background:' + sbg + ';color:' + sc + ';border:1px solid ' + sc + ';'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;'
+            'font-family:JetBrains Mono,monospace;">'
+            + sicon + ' ' + stock.get('strategy_label', '') + '</span>'
+        )
+
+        # バッジ類
+        ew    = stock.get("earnings_warning")
+        dw    = stock.get("div_warning")
+        dte   = stock.get("days_to_earnings")
+        dtd   = stock.get("days_to_ex_div")
+        madj  = stock.get("market_score_adj", 0)
+        cbonus    = stock.get("candle_bonus", 0)
+        cpatterns = stock.get("candle_patterns", [])
+        cnotes    = stock.get("candle_notes", [])
+
+        earnings_badge_html = (
+            '<span style="background:#4a0d0d;color:#f85149;border:1px solid #f85149;'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+            '&#128680; 決算' + str(dte) + '日前・エントリー危険</span>'
+        ) if ew == "danger" else (
+            '<span style="background:#3a2500;color:#ffa657;border:1px solid #f0883e;'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+            '&#9888; 決算' + str(dte) + '日前・要注意</span>'
+        ) if ew == "caution" else ""
+
+        div_badge_html = (
+            '<span style="background:#1a2a3a;color:#79c0ff;border:1px solid #388bfd;'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+            '&#128180; 配当落ち' + str(dtd) + '日前</span>'
+        ) if dw == "caution" else ""
+
+        market_adj_html = (
+            '<span style="background:#0d2a1a;color:#3fb950;border:1px solid #238636;'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+            '&#8593; 地合いボーナス +' + str(madj) + 'pt</span>'
+        ) if madj > 0 else (
+            '<span style="background:#2a1a1a;color:#f85149;border:1px solid #f85149;'
+            'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+            '&#8595; 地合いペナルティ ' + str(madj) + 'pt</span>'
+        ) if madj < 0 else ""
+
+        if cpatterns and cbonus > 0:
+            candle_badge_html = (
+                '<span style="background:#1a3a2a;color:#3fb950;border:1px solid #2ea043;'
+                'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+                '&#9679; ' + " / ".join(cpatterns[:2]) + ' +' + str(cbonus) + 'pt</span>'
+            )
+        elif cpatterns and cbonus < 0:
+            candle_badge_html = (
+                '<span style="background:#3a1a1a;color:#f85149;border:1px solid #f85149;'
+                'padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">'
+                '&#9679; ' + " / ".join(cpatterns[:2]) + ' ' + str(cbonus) + 'pt</span>'
+            )
+        else:
+            candle_badge_html = ""
+
+        if cnotes:
+            note_color       = "#3fb950" if cbonus > 0 else "#f85149"
+            candle_note_html = (
+                '<div style="background:#0d1117;border-radius:6px;padding:8px 10px;'
+                'margin-top:4px;font-size:0.75rem;border-left:3px solid ' + note_color + ';">'
+                '<span style="color:#8b949e;">&#128337; ローソク足文脈：</span>'
+                '<span style="color:' + note_color + ';">' + cnotes[0] + '</span>'
+                '</div>'
+            )
+        else:
+            candle_note_html = ""
+
+        # 売買代金
+        daily_val = stock.get("daily_value", 0)
+        if daily_val >= 1e10:
+            daily_val_str = f"{daily_val/1e10:.1f}兆円"
+        elif daily_val >= 1e8:
+            daily_val_str = f"{daily_val/1e8:.0f}億円"
+        else:
+            daily_val_str = f"{daily_val/1e6:.0f}百万円"
+
+        pct_color  = "#3fb950" if stock['pct_1d'] >= 0 else "#f85149"
+        pct5_color = "#3fb950" if stock['pct_5d'] >= 0 else "#f85149"
+        sign1d     = "+" if stock['pct_1d'] >= 0 else ""
+        sign5d     = "+" if stock['pct_5d'] >= 0 else ""
+
+        reasons_str   = "　|　".join(stock['reasons'][:4])
+        strategy_desc = stock.get('strategy_desc', '')
+        stock_name    = stock['name']
+        stock_code    = stock['code']
+
+        score_int     = int(stock['score'])
+        cur_price_str = f"&#165;{stock['current_price']:,.0f}"
+        entry_str     = f"&#165;{stock['entry_price']:,.0f}"
+        score_color   = "#f85149" if is_short else "#ffa657"
+        bar_color     = "linear-gradient(90deg,#f85149,#ff6b6b)" if is_short else "linear-gradient(90deg,#238636,#2ea043)"
+
+        # 売り：利確は下方向なので表示を調整
+        if is_short:
+            tp_str = f"&#165;{stock['take_profit']:,.0f} (-{stock['profit_pct']:.1f}%)"
+            sl_str = f"&#165;{stock['stop_loss']:,.0f} (+{abs(stock['loss_pct']):.1f}%)"
+        else:
+            tp_str = f"&#165;{stock['take_profit']:,.0f} (+{stock['profit_pct']:.1f}%)"
+            sl_str = f"&#165;{stock['stop_loss']:,.0f} ({stock['loss_pct']:.1f}%)"
+        rr_str    = f"1:{stock['rr_ratio']:.1f}"
+        rsi_str   = f"{stock['rsi']:.1f}"
+        bb_pct_str = f"{stock['bb_pct']:.0%}"
+        vol_str   = f"{stock['vol_ratio']:.1f}x"
+        pct1d_str = f"{sign1d}{stock['pct_1d']:.1f}%"
+        pct5d_str = f"{sign5d}{stock['pct_5d']:.1f}%"
+
+        card_border = "border-left:4px solid #f85149;" if is_short and rank <= 3 else ""
+
+        card_html = (
+            '<div class="rank-card ' + card_class + '" style="' + card_border + '">'
+            + '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
+            +   '<div style="display:flex;align-items:center;gap:12px;">'
+            +     '<span style="font-size:1.4rem;">' + rank_icon + '</span>'
+            +     '<div>'
+            +       '<div style="color:#f0f6fc;font-weight:700;font-size:1rem;">' + stock_name + '</div>'
+            +       '<div style="color:#8b949e;font-size:0.75rem;">東証プライム / ' + stock_code + '</div>'
+            +     '</div>'
+            +   '</div>'
+            +   '<div style="text-align:right;">'
+            +     '<div style="color:' + score_color + ';font-size:1.6rem;font-weight:700;font-family:JetBrains Mono,monospace;">'
+            +       str(score_int) + '<span style="font-size:0.8rem;color:#8b949e;">/100</span>'
+            +     '</div>'
+            +     '<div class="score-bar-bg"><div style="height:6px;border-radius:4px;background:' + bar_color + ';width:' + str(score_int) + '%;"></div></div>'
+            +   '</div>'
+            + '</div>'
+            + '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:10px 0;font-family:JetBrains Mono,monospace;font-size:0.82rem;">'
+            +   '<div><div class="order-label">現在値</div><div style="color:#f0f6fc;font-weight:600;">' + cur_price_str + '</div></div>'
+            +   '<div><div class="order-label">売りエントリー</div><div style="color:#f85149;font-weight:600;">' + entry_str + '</div></div>' if is_short else
+                '<div><div class="order-label">エントリー</div><div class="order-entry">' + entry_str + '</div></div>'
+            +   '<div><div class="order-label">利確目標</div><div class="order-profit">' + tp_str + '</div></div>'
+            +   '<div><div class="order-label">損切ライン</div><div class="order-loss">' + sl_str + '</div></div>'
+            +   '<div><div class="order-label">RR比</div><div style="color:#ffa657;font-weight:600;">' + rr_str + '</div></div>'
+            + '</div>'
+            + '<div style="margin:8px 0;">' + strategy_badge + '&nbsp;&nbsp;' + signals_html + '</div>'
+            + '<div style="margin:4px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'
+            +   earnings_badge_html + div_badge_html + market_adj_html + candle_badge_html
+            + '</div>'
+            + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:8px;font-size:0.78rem;color:#8b949e;">'
+            +   '<strong style="color:#f0f6fc;">&#127919; エントリー根拠：</strong>'
+            +   '<span style="color:' + sc + ';">' + strategy_desc + '</span>'
+            + '</div>'
+            + candle_note_html
+            + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:6px;font-size:0.78rem;color:#8b949e;">'
+            +   '<strong style="color:#f0f6fc;">&#128202; スコア解説：</strong>' + reasons_str
+            + '</div>'
+            + '<div style="margin-top:8px;font-size:0.75rem;display:flex;gap:16px;flex-wrap:wrap;">'
+            +   '<span>1日: <b style="color:' + pct_color + ';">' + pct1d_str + '</b></span>'
+            +   '<span>5日: <b style="color:' + pct5_color + ';">' + pct5d_str + '</b></span>'
+            +   '<span>RSI: <b style="color:#d2a8ff;">' + rsi_str + '</b></span>'
+            +   '<span>BB位置: <b style="color:#79c0ff;">' + bb_pct_str + '</b></span>'
+            +   '<span>出来高比: <b style="color:#ffa657;">' + vol_str + '</b></span>'
+            +   '<span style="color:#8b949e;">売買代金: <b style="color:#c9d1d9;">' + daily_val_str + '</b></span>'
+            + '</div>'
+            + '</div>'
+        )
+        st.markdown(card_html, unsafe_allow_html=True)
+
+        expander_label = ("📉 " if is_short else "📈 ") + stock['name'] + " の詳細チャート・IFDOCO注文"
+        with st.expander(expander_label):
+            ch_col, order_col = st.columns([3, 1])
+            with ch_col:
+                fig = draw_chart(stock)
+                st.plotly_chart(fig, use_container_width=True)
+            with order_col:
+                capital    = portfolio.get("account_capital", 3000000)
+                units      = calc_margin_units(capital, stock['entry_price'])
+                cost       = stock['entry_price'] * units
+                if is_short:
+                    est_profit = (stock['entry_price'] - stock['take_profit']) * units
+                    est_loss   = (stock['stop_loss']   - stock['entry_price']) * units
+                else:
+                    est_profit = (stock['take_profit'] - stock['entry_price']) * units
+                    est_loss   = (stock['entry_price'] - stock['stop_loss'])   * units
+
+                st.markdown(f"""
+                <div style="margin-bottom:12px;background:#161b22;border:1px solid #30363d;border-radius:8px;padding:12px;">
+                    <div class="order-label">推奨株数（信用3倍）</div>
+                    <div style="color:#ffa657;font-size:1.3rem;font-weight:700;margin:4px 0;">{units:,} 株</div>
+                    <div class="order-label">想定コスト（信用枠）</div>
+                    <div style="color:#f0f6fc;font-size:0.85rem;">¥{cost:,.0f}</div>
+                    <div style="margin-top:8px;">
+                        <div class="order-label">期待利益</div>
+                        <div style="color:#3fb950;font-weight:600;">+¥{est_profit:,.0f}</div>
+                        <div class="order-label">リスク金額</div>
+                        <div style="color:#f85149;font-weight:600;">-¥{est_loss:,.0f}</div>
+                    </div>
+                </div>
+                """, unsafe_allow_html=True)
+                show_ifdoco_order(stock)
+
+                btn_key = ("short_add_" if is_short else "add_") + stock['code']
+                if st.button(f"&#128204; {stock['code']} をポートフォリオに追加", key=btn_key):
+                    portfolio["positions"].append({
+                        "code": stock['code'], "name": stock['name'],
+                        "entry_price": stock['entry_price'], "units": units,
+                        "take_profit": stock['take_profit'], "stop_loss": stock['stop_loss'],
+                    })
+                    save_portfolio(portfolio)
+                    st.success(f"&#10003; {stock['name']} を追加しました！")
+
+
 # ─── メインアプリ ─────────────────────────────────────────────
 def main():
     portfolio = load_portfolio()
@@ -1654,6 +2068,8 @@ def main():
         st.session_state.rankings_loaded = False
     if "rankings_data" not in st.session_state:
         st.session_state.rankings_data = []
+    if "short_rankings_data" not in st.session_state:
+        st.session_state.short_rankings_data = []
     if "market_env_data" not in st.session_state:
         st.session_state.market_env_data = {}
 
@@ -1720,9 +2136,10 @@ def main():
         if st.button("🔄 ランキング更新", use_container_width=True):
             compute_rankings.clear()
             calc_market_environment.clear()
-            st.session_state.rankings_loaded  = False
-            st.session_state.rankings_data    = []
-            st.session_state.market_env_data  = {}
+            st.session_state.rankings_loaded     = False
+            st.session_state.rankings_data       = []
+            st.session_state.short_rankings_data = []
+            st.session_state.market_env_data     = {}
             st.rerun()
 
     if "ランキング" in page:
@@ -1742,241 +2159,37 @@ def main():
             with col2:
                 if st.button("📈 ランキングを取得する", use_container_width=True):
                     with st.spinner("銘柄データを取得・分析中...（しばらくお待ちください）"):
-                        rankings, market_env = compute_rankings()
-                    st.session_state.rankings_data   = rankings
-                    st.session_state.market_env_data = market_env
-                    st.session_state.rankings_loaded = True
+                        rankings, short_rankings, market_env = compute_rankings()
+                    st.session_state.rankings_data       = rankings
+                    st.session_state.short_rankings_data = short_rankings
+                    st.session_state.market_env_data     = market_env
+                    st.session_state.rankings_loaded     = True
                     st.rerun()
             return
 
-        rankings   = st.session_state.rankings_data
-        market_env = st.session_state.get("market_env_data", {})
+        rankings        = st.session_state.rankings_data
+        short_rankings  = st.session_state.get("short_rankings_data", [])
+        market_env      = st.session_state.get("market_env_data", {})
 
         # 市場環境バナー
         show_market_environment(market_env)
 
-        # ─── フィルタリング ─────────────────────────────────
-        def passes_filter(r):
-            # スコア・RR
-            if r['score'] < min_score:               return False
-            if r['rr_ratio'] < min_rr:               return False
-            # 流動性
-            if r['vol_ratio'] < min_vol_ratio:        return False
-            if r.get('daily_value', 0) < min_daily_val_v: return False
-            # 価格帯
-            if r['current_price'] < min_price:        return False
-            if max_price > 0 and r['current_price'] > max_price: return False
-            # 決算除外
-            if exclude_earnings_danger and r.get('earnings_warning') == 'danger': return False
-            # 強気ローソク足
-            if require_bullish_candle and r.get('candle_bonus', 0) <= 0: return False
-            return True
+        # タブ分割
+        tab_long, tab_short = st.tabs(["📈 買いランキング", "📉 売りランキング（信用売り）"])
 
-        filtered = [r for r in rankings if passes_filter(r)]
+        with tab_long:
+            _render_ranking(rankings, market_env, "long",
+                            min_score, min_rr, min_vol_ratio, min_daily_val_v,
+                            min_price, max_price,
+                            exclude_earnings_danger, require_bullish_candle,
+                            portfolio)
 
-        if not filtered:
-            st.warning("現在の条件に合う銘柄がありません。フィルターを緩めてください。")
-            return
-
-        # ランキング表示
-        selected_stock = None
-        for i, stock in enumerate(filtered):
-            rank = i + 1
-            card_class = "gold" if rank == 1 else ("silver" if rank == 2 else ("bronze" if rank == 3 else "normal"))
-            rank_icon = "🥇" if rank == 1 else ("🥈" if rank == 2 else ("🥉" if rank == 3 else f"#{rank}"))
-
-            score_pct = stock['score']
-            signals_html = "".join([
-                f'<span class="signal-tag tag-buy">{s}</span>' for s in stock['signals'][:3]
-            ])
-
-            # 戦略タイプのバッジ色
-            stype = stock.get('strategy_type', 'ATR')
-            strat_colors = {
-                "D":   ("#ff9500", "#3a2500", "🚀"),
-                "A1":  ("#79c0ff", "#0d2a45", "📐"),
-                "A2":  ("#79c0ff", "#0d2a45", "📐"),
-                "B":   ("#d2a8ff", "#2a1a45", "↩️"),
-                "C":   ("#3fb950", "#0d2a1a", "🏗️"),
-                "ATR": ("#8b949e", "#21262d", "📊"),
-            }
-            sc, sbg, sicon = strat_colors.get(stype, strat_colors["ATR"])
-            strategy_badge = f'<span style="background:{sbg};color:{sc};border:1px solid {sc};padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;font-family:\'JetBrains Mono\',monospace;">{sicon} {stock.get("strategy_label","")}</span>'
-
-            # 決算・配当・地合いバッジ生成
-            ew = stock.get("earnings_warning")
-            dw = stock.get("div_warning")
-            dte = stock.get("days_to_earnings")
-            dtd = stock.get("days_to_ex_div")
-            madj = stock.get("market_score_adj", 0)
-            cbonus    = stock.get("candle_bonus", 0)
-            cpatterns = stock.get("candle_patterns", [])
-            cnotes    = stock.get("candle_notes", [])
-
-            if ew == "danger":
-                earnings_badge_html = '<span style="background:#4a0d0d;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#128680; 決算' + str(dte) + '日前・エントリー危険</span>'
-            elif ew == "caution":
-                earnings_badge_html = '<span style="background:#3a2500;color:#ffa657;border:1px solid #f0883e;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9888; 決算' + str(dte) + '日前・要注意</span>'
-            else:
-                earnings_badge_html = ""
-
-            if dw == "caution":
-                div_badge_html = '<span style="background:#1a2a3a;color:#79c0ff;border:1px solid #388bfd;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#128180; 配当落ち' + str(dtd) + '日前</span>'
-            else:
-                div_badge_html = ""
-
-            if madj > 0:
-                market_adj_html = '<span style="background:#0d2a1a;color:#3fb950;border:1px solid #238636;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#8593; 地合いボーナス +' + str(madj) + 'pt</span>'
-            elif madj < 0:
-                market_adj_html = '<span style="background:#2a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#8595; 地合いペナルティ ' + str(madj) + 'pt</span>'
-            else:
-                market_adj_html = ""
-
-            # ローソク足パターンバッジ＋文脈メモ
-            if cpatterns and cbonus > 0:
-                candle_badge_html = '<span style="background:#1a3a2a;color:#3fb950;border:1px solid #2ea043;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9679; ' + " / ".join(cpatterns[:2]) + ' +' + str(cbonus) + 'pt</span>'
-            elif cpatterns and cbonus < 0:
-                candle_badge_html = '<span style="background:#3a1a1a;color:#f85149;border:1px solid #f85149;padding:2px 8px;border-radius:4px;font-size:0.72rem;font-weight:700;">&#9679; ' + " / ".join(cpatterns[:2]) + ' ' + str(cbonus) + 'pt</span>'
-            else:
-                candle_badge_html = ""
-
-            if cnotes:
-                note_color       = "#3fb950" if cbonus > 0 else "#f85149"
-                candle_note_html = (
-                    '<div style="background:#0d1117;border-radius:6px;padding:8px 10px;'
-                    'margin-top:4px;font-size:0.75rem;border-left:3px solid ' + note_color + ';">'
-                    '<span style="color:#8b949e;">&#128337; ローソク足文脈：</span>'
-                    '<span style="color:' + note_color + ';">' + cnotes[0] + '</span>'
-                    '</div>'
-                )
-            else:
-                candle_note_html = ""
-
-            # 売買代金
-            daily_val = stock.get("daily_value", 0)
-            if daily_val >= 1e10:
-                daily_val_str = f"{daily_val/1e10:.1f}兆円"
-            elif daily_val >= 1e8:
-                daily_val_str = f"{daily_val/1e8:.0f}億円"
-            else:
-                daily_val_str = f"{daily_val/1e6:.0f}百万円"
-
-
-            pct_color  = "#3fb950" if stock['pct_1d'] >= 0 else "#f85149"
-            pct5_color = "#3fb950" if stock['pct_5d'] >= 0 else "#f85149"
-            sign1d = "+" if stock['pct_1d'] >= 0 else ""
-            sign5d = "+" if stock['pct_5d'] >= 0 else ""
-
-            # f-string内で式を使うとHTML描画が壊れるため全て事前に変数化
-            reasons_str   = "　|　".join(stock['reasons'][:4])
-            strategy_desc = stock.get('strategy_desc', '')
-            stock_name    = stock['name']
-            stock_code    = stock['code']
-
-            # f-string内にHTML変数を混ぜるとレンダラーが壊れるため
-            # 文字列連結でHTMLを組み立てる
-            score_int     = int(stock['score'])
-            cur_price_str = f"¥{stock['current_price']:,.0f}"
-            entry_str     = f"¥{stock['entry_price']:,.0f}"
-            tp_str        = f"¥{stock['take_profit']:,.0f} (+{stock['profit_pct']:.1f}%)"
-            sl_str        = f"¥{stock['stop_loss']:,.0f} ({stock['loss_pct']:.1f}%)"
-            rr_str        = f"1:{stock['rr_ratio']:.1f}"
-            rsi_str       = f"{stock['rsi']:.1f}"
-            bb_pct_str    = f"{stock['bb_pct']:.0%}"
-            vol_str       = f"{stock['vol_ratio']:.1f}x"
-            pct1d_str     = f"{sign1d}{stock['pct_1d']:.1f}%"
-            pct5d_str     = f"{sign5d}{stock['pct_5d']:.1f}%"
-
-            card_html = (
-                '<div class="rank-card ' + card_class + '">'
-                + '<div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:10px;">'
-                +   '<div style="display:flex;align-items:center;gap:12px;">'
-                +     '<span style="font-size:1.4rem;">' + rank_icon + '</span>'
-                +     '<div>'
-                +       '<div style="color:#f0f6fc;font-weight:700;font-size:1rem;">' + stock_name + '</div>'
-                +       '<div style="color:#8b949e;font-size:0.75rem;">東証プライム / ' + stock_code + '</div>'
-                +     '</div>'
-                +   '</div>'
-                +   '<div style="text-align:right;">'
-                +     '<div style="color:#ffa657;font-size:1.6rem;font-weight:700;font-family:JetBrains Mono,monospace;">'
-                +       str(score_int) + '<span style="font-size:0.8rem;color:#8b949e;">/100</span>'
-                +     '</div>'
-                +     '<div class="score-bar-bg"><div class="score-bar-fill" style="width:' + str(score_int) + '%;"></div></div>'
-                +   '</div>'
-                + '</div>'
-                + '<div style="display:grid;grid-template-columns:repeat(5,1fr);gap:10px;margin:10px 0;font-family:JetBrains Mono,monospace;font-size:0.82rem;">'
-                +   '<div><div class="order-label">現在値</div><div style="color:#f0f6fc;font-weight:600;">' + cur_price_str + '</div></div>'
-                +   '<div><div class="order-label">エントリー</div><div class="order-entry">' + entry_str + '</div></div>'
-                +   '<div><div class="order-label">利確目標</div><div class="order-profit">' + tp_str + '</div></div>'
-                +   '<div><div class="order-label">損切ライン</div><div class="order-loss">' + sl_str + '</div></div>'
-                +   '<div><div class="order-label">RR比</div><div style="color:#ffa657;font-weight:600;">' + rr_str + '</div></div>'
-                + '</div>'
-                + '<div style="margin:8px 0;">' + strategy_badge + '&nbsp;&nbsp;' + signals_html + '</div>'
-                + '<div style="margin:4px 0;display:flex;flex-wrap:wrap;gap:6px;align-items:center;">'
-                +   earnings_badge_html + div_badge_html + market_adj_html + candle_badge_html
-                + '</div>'
-                + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:8px;font-size:0.78rem;color:#8b949e;">'
-                +   '<strong style="color:#f0f6fc;">&#127919; エントリー根拠：</strong>'
-                +   '<span style="color:' + sc + ';">' + strategy_desc + '</span>'
-                + '</div>'
-                + candle_note_html
-                + '<div style="background:#0d1117;border-radius:6px;padding:10px;margin-top:6px;font-size:0.78rem;color:#8b949e;">'
-                +   '<strong style="color:#f0f6fc;">&#128202; スコア解説：</strong>' + reasons_str
-                + '</div>'
-                + '<div style="margin-top:8px;font-size:0.75rem;display:flex;gap:16px;flex-wrap:wrap;">'
-                +   '<span>1日: <b style="color:' + pct_color + ';">' + pct1d_str + '</b></span>'
-                +   '<span>5日: <b style="color:' + pct5_color + ';">' + pct5d_str + '</b></span>'
-                +   '<span>RSI: <b style="color:#d2a8ff;">' + rsi_str + '</b></span>'
-                +   '<span>BB位置: <b style="color:#79c0ff;">' + bb_pct_str + '</b></span>'
-                +   '<span>出来高比: <b style="color:#ffa657;">' + vol_str + '</b></span>'
-                +   '<span style="color:#8b949e;">売買代金: <b style="color:#c9d1d9;">' + daily_val_str + '</b></span>'
-                + '</div>'
-                + '</div>'
-            )
-            st.markdown(card_html, unsafe_allow_html=True)
-
-            # チャートとIFDOCO注文
-            with st.expander(f"📈 {stock['name']} の詳細チャート・IFDOCO注文"):
-                ch_col, order_col = st.columns([3, 1])
-                with ch_col:
-                    fig = draw_chart(stock)
-                    st.plotly_chart(fig, use_container_width=True)
-                with order_col:
-                    # 信用取引の口数計算
-                    capital = portfolio.get("account_capital", 3000000)
-                    units = calc_margin_units(capital, stock['entry_price'])
-                    cost = stock['entry_price'] * units
-                    est_profit = (stock['take_profit'] - stock['entry_price']) * units
-                    est_loss = (stock['entry_price'] - stock['stop_loss']) * units
-
-                    st.markdown(f"""
-                    <div style="margin-bottom:12px; background:#161b22; border:1px solid #30363d; border-radius:8px; padding:12px;">
-                        <div class="order-label">推奨株数（信用3倍）</div>
-                        <div style="color:#ffa657; font-size:1.3rem; font-weight:700; margin:4px 0;">{units:,} 株</div>
-                        <div class="order-label">想定コスト（信用枠）</div>
-                        <div style="color:#f0f6fc; font-size:0.85rem;">¥{cost:,.0f}</div>
-                        <div style="margin-top:8px;">
-                            <div class="order-label">期待利益</div>
-                            <div style="color:#3fb950; font-weight:600;">+¥{est_profit:,.0f}</div>
-                            <div class="order-label">リスク金額</div>
-                            <div style="color:#f85149; font-weight:600;">-¥{est_loss:,.0f}</div>
-                        </div>
-                    </div>
-                    """, unsafe_allow_html=True)
-                    show_ifdoco_order(stock)
-
-                    # ポートフォリオに追加ボタン
-                    if st.button(f"📌 {stock['code']} をポートフォリオに追加", key=f"add_{stock['code']}"):
-                        portfolio["positions"].append({
-                            "code": stock['code'],
-                            "name": stock['name'],
-                            "entry_price": stock['entry_price'],
-                            "units": units,
-                            "take_profit": stock['take_profit'],
-                            "stop_loss": stock['stop_loss'],
-                        })
-                        save_portfolio(portfolio)
-                        st.success(f"✅ {stock['name']} を追加しました！")
+        with tab_short:
+            _render_ranking(short_rankings, market_env, "short",
+                            min_score, min_rr, min_vol_ratio, min_daily_val_v,
+                            min_price, max_price,
+                            exclude_earnings_danger, False,
+                            portfolio)
 
     # ─── ポートフォリオページ ────────────────────────────────
     else:
